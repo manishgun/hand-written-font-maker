@@ -1,7 +1,9 @@
 import { useEffect, useState, useRef } from "react";
 import opencv from "@techstark/opencv-js";
+import Potrace from "potrace";
 
 function App() {
+  const [cells, setCells] = useState<string[]>([]);
   const [cv, setCV] = useState<typeof opencv | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -22,7 +24,7 @@ function App() {
   const processImage = () => {
     setIsProcessing(true);
     const img = new Image();
-    img.src = "/scan.jpg";
+    img.src = "/IMG_20260228_020759.jpg.jpeg";
     img.onload = () => {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -56,18 +58,42 @@ function App() {
     };
   };
 
-  function detectMarkers(canvas: HTMLCanvasElement) {
+  async function detectMarkers(canvas: HTMLCanvasElement) {
     if (!cv) return;
     const src = cv.imread(canvas);
     const gray = new cv.Mat();
     const thresh = new cv.Mat();
+    const edges = new cv.Mat();
     const contours = new cv.MatVector();
     const hierarchy = new cv.Mat();
 
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-    cv.threshold(gray, thresh, 120, 255, cv.THRESH_BINARY_INV);
 
-    cv.findContours(thresh, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+    cv.imshow(canvas, gray);
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 500);
+    });
+
+    // cv.threshold(gray, thresh, 120, 255, cv.THRESH_BINARY_INV);
+
+    // cv.imshow(canvas, thresh);
+
+    // await new Promise((resolve) => {
+    //   setTimeout(resolve, 500);
+    // });
+
+    cv.Canny(gray, edges, 50, 150);
+
+    cv.imshow(canvas, edges);
+
+    await new Promise((resolve) => {
+      setTimeout(resolve, 500);
+    });
+
+    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    const EDGE_POINTERS: opencv.Rect[] = [];
 
     for (let i = 0; i < contours.size(); i++) {
       const cnt = contours.get(i);
@@ -75,12 +101,15 @@ function App() {
       const approx = new cv.Mat();
       cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
 
-      if (approx.rows === 4) {
+      if (approx.rows === 4 && cv.isContourConvex(approx)) {
         const rect = cv.boundingRect(cnt);
-        // Only mark if it's potentially a marker (square-ish and reasonable size)
-        const aspectRatio = rect.width / rect.height;
-        if (aspectRatio > 0.8 && aspectRatio < 1.2 && rect.width > 20) {
-          cv.rectangle(src, new cv.Point(rect.x, rect.y), new cv.Point(rect.x + rect.width, rect.y + rect.height), new cv.Scalar(59, 130, 246, 255), 3); // Modern blue
+
+        const aspect = rect.width / rect.height;
+
+        if (rect.width > 25 && aspect > 0.8 && aspect < 1.4) {
+          console.log(rect, aspect);
+          cv.rectangle(src, new cv.Point(rect.x, rect.y), new cv.Point(rect.x + rect.width, rect.y + rect.height), new cv.Scalar(59, 130, 246, 255), 3);
+          EDGE_POINTERS.push(rect);
         }
       }
       approx.delete();
@@ -88,12 +117,149 @@ function App() {
 
     cv.imshow(canvas, src);
 
+    await new Promise((resolve) => {
+      setTimeout(resolve, 500);
+    });
+
+    // if (EDGE_POINTERS.length) return;
+
+    console.log(EDGE_POINTERS);
+
+    if (EDGE_POINTERS.length === 4) {
+      const tl = EDGE_POINTERS.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
+
+      const tr = EDGE_POINTERS.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
+
+      const br = EDGE_POINTERS.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
+
+      const bl = EDGE_POINTERS.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
+
+      const width = 800; // Math.floor(maxWidth);
+      const height = 1000; // Math.floor(maxHeight);
+
+      const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y + tl.height, tr.x + tr.width, tr.y + tr.height, br.x + br.width, br.y, bl.x, bl.y]);
+
+      const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, width, 0, width, height, 0, height]);
+
+      // 9️⃣ Perspective transform
+      const M = cv.getPerspectiveTransform(srcTri, dstTri);
+      const warped = new cv.Mat();
+
+      cv.warpPerspective(src, warped, M, new cv.Size(width, height));
+
+      // 10️⃣ Optional: crop inside margin
+      // const margin = 40;
+      // const cropped = warped.roi(new cv.Rect(margin, margin, width - 2 * margin, height - 2 * margin));
+
+      // Show result
+      cv.imshow(canvas, warped);
+    }
+
+    // cv.imshow(canvas, src);
+
     src.delete();
     gray.delete();
     thresh.delete();
+    edges.delete();
     contours.delete();
     hierarchy.delete();
+
+    cleanImage(canvas);
   }
+
+  const cleanImage = (canvas: HTMLCanvasElement) => {
+    if (!cv) return;
+
+    const src = cv.imread(canvas);
+    const gray = new cv.Mat();
+    const denoised = new cv.Mat();
+    const thresh = new cv.Mat();
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+
+    // 1️⃣ Grayscale
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+    // 2️⃣ Strong noise reduction (better than Gaussian)
+    // cv.medianBlur(gray, denoised, 5);
+
+    // 3️⃣ Otsu threshold (automatic)
+    // cv.threshold(denoised, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+
+    // 4️⃣ Remove small black specks
+    cv.morphologyEx(gray, thresh, cv.MORPH_OPEN, kernel);
+
+    // 5️⃣ Optional: Remove tiny connected components
+    // removeSmallComponents(thresh, 50);
+
+    cv.imshow(canvas, src);
+
+    src.delete();
+    gray.delete();
+    denoised.delete();
+    kernel.delete();
+
+    spliter(canvas);
+  };
+
+  const spliter = async (canvas: HTMLCanvasElement) => {
+    const DIMENSIONS = {
+      rows: 8,
+      columns: 8,
+      rowGap: 40,
+      columnGap: 4,
+    } as const;
+
+    const cells: string[] = [];
+
+    const width = (canvas.width - (DIMENSIONS.columns + 1) * DIMENSIONS.columnGap) / DIMENSIONS.columns;
+    const height = (canvas.height - (DIMENSIONS.rows + 1) * DIMENSIONS.rowGap) / DIMENSIONS.rows;
+
+    const ctx = canvas.getContext("2d");
+
+    if (ctx) {
+      for (let r = 0; r < DIMENSIONS.rows; r++) {
+        for (let c = 0; c < DIMENSIONS.columns; c++) {
+          // const x = c * width;
+          // const y = r * (height + DIMENSIONS.rowGap * r );
+
+          const x = (c + 1) * DIMENSIONS.columnGap + c * width;
+          const y = (r + 1) * DIMENSIONS.rowGap + r * height;
+
+          const cellCanvas = document.createElement("canvas");
+
+          cellCanvas.width = width;
+          cellCanvas.height = height;
+
+          const cellCtx = cellCanvas.getContext("2d");
+
+          if (cellCtx) {
+            cellCtx.drawImage(canvas, x, y + 2, width - 2, height - 2, 0, 0, width, height);
+            //  const image =  cellCtx.getImageData(0, 0, width, height);
+
+            const svg = await new Promise<string>((resolve, reject) => {
+              Potrace.trace(
+                cellCanvas.toDataURL(),
+                {
+                  threshold: 200,
+                  turdSize: 6, // removes small noise
+                  optTolerance: 0.2,
+                  // turdPolicy: "minority",
+                },
+                (error, svg) => {
+                  if (error) reject(error);
+                  else if (svg) resolve(svg);
+                },
+              );
+            });
+
+            cells.push(svg);
+          }
+        }
+      }
+    }
+
+    setCells(cells);
+  };
 
   return (
     <div className="min-h-screen w-full flex flex-col items-center justify-center p-6 bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black overflow-hidden selection:bg-blue-500/30">
@@ -137,6 +303,12 @@ function App() {
                 className={`max-w-full h-auto rounded-lg shadow-2xl transition-all duration-700 ${isProcessing ? "scale-95 blur-sm opacity-50" : "scale-100 blur-0 opacity-100"}`}
               />
             </div>
+          </div>
+
+          <div className="grid grid-cols-8 gap-3">
+            {cells.map((cell, idx) => {
+              return <div className="bg-white rounded" dangerouslySetInnerHTML={{ __html: cell }} key={idx} />;
+            })}
           </div>
         </main>
 
