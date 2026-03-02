@@ -1,9 +1,79 @@
 import { useEffect, useState, useRef } from "react";
 import opencv from "@techstark/opencv-js";
 import Potrace from "potrace";
+import opentype from "opentype.js";
+import { DOMParser } from "xmldom";
+import svgpath from "svgpath";
+
+const TYPE_SEQUENCE = [
+  "!",
+  '"',
+  "%",
+  "&",
+  "'",
+  "(",
+  undefined,
+  undefined,
+  ")",
+  "+",
+  ",",
+  "-",
+  ".",
+  "/",
+  undefined,
+  undefined,
+  ":",
+  ";",
+  "=",
+  "?",
+  "@",
+  "A",
+  "B",
+  "C",
+  "D",
+  "E",
+  "F",
+  "G",
+  "H",
+  "I",
+  "J",
+  "K",
+  "L",
+  "M",
+  "N",
+  "O",
+  "P",
+  "Q",
+  "R",
+  "S",
+  "T",
+  "U",
+  "V",
+  "W",
+  "X",
+  "Y",
+  "Z",
+  "a",
+  "b",
+  "c",
+  "d",
+  "e",
+  "f",
+  "g",
+  "h",
+  "i",
+  "j",
+  "k",
+  "l",
+  "m",
+  "n",
+  "o",
+  "p",
+  "q",
+];
 
 function App() {
-  const [cells, setCells] = useState<string[]>([]);
+  const [cells, setCells] = useState<{ type: string; svg: string }[]>([]);
   const [cv, setCV] = useState<typeof opencv | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -35,15 +105,15 @@ function App() {
       const maxDim = 1200;
       let width = img.width;
       let height = img.height;
-      if (width > maxDim || height > maxDim) {
-        if (width > height) {
-          height *= maxDim / width;
-          width = maxDim;
-        } else {
-          width *= maxDim / height;
-          height = maxDim;
-        }
-      }
+      // if (width > maxDim || height > maxDim) {
+      //   if (width > height) {
+      //     height *= maxDim / width;
+      //     width = maxDim;
+      //   } else {
+      //     width *= maxDim / height;
+      //     height = maxDim;
+      //   }
+      // }
 
       canvas.width = width;
       canvas.height = height;
@@ -107,8 +177,8 @@ function App() {
         const aspect = rect.width / rect.height;
 
         if (rect.width > 25 && aspect > 0.8 && aspect < 1.4) {
-          console.log(rect, aspect);
-          cv.rectangle(src, new cv.Point(rect.x, rect.y), new cv.Point(rect.x + rect.width, rect.y + rect.height), new cv.Scalar(59, 130, 246, 255), 3);
+          // console.log(rect, aspect);
+          // cv.rectangle(src, new cv.Point(rect.x, rect.y), new cv.Point(rect.x + rect.width, rect.y + rect.height), new cv.Scalar(59, 130, 246, 255), 3);
           EDGE_POINTERS.push(rect);
         }
       }
@@ -170,14 +240,14 @@ function App() {
   const cleanImage = (canvas: HTMLCanvasElement) => {
     if (!cv) return;
 
-    const src = cv.imread(canvas);
-    const gray = new cv.Mat();
-    const denoised = new cv.Mat();
-    const thresh = new cv.Mat();
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    // const src = cv.imread(canvas);
+    // const gray = new cv.Mat();
+    // const denoised = new cv.Mat();
+    // const thresh = new cv.Mat();
+    // const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
 
     // 1️⃣ Grayscale
-    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    // cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
     // 2️⃣ Strong noise reduction (better than Gaussian)
     // cv.medianBlur(gray, denoised, 5);
@@ -186,17 +256,17 @@ function App() {
     // cv.threshold(denoised, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
 
     // 4️⃣ Remove small black specks
-    cv.morphologyEx(gray, thresh, cv.MORPH_OPEN, kernel);
+    // cv.morphologyEx(gray, thresh, cv.MORPH_OPEN, kernel);
 
     // 5️⃣ Optional: Remove tiny connected components
     // removeSmallComponents(thresh, 50);
 
-    cv.imshow(canvas, src);
+    // cv.imshow(canvas, src);
 
-    src.delete();
-    gray.delete();
-    denoised.delete();
-    kernel.delete();
+    // src.delete();
+    // gray.delete();
+    // denoised.delete();
+    // kernel.delete();
 
     spliter(canvas);
   };
@@ -209,16 +279,22 @@ function App() {
       columnGap: 4,
     } as const;
 
-    const cells: string[] = [];
+    const cells: { svg: string; type: string }[] = [];
 
     const width = (canvas.width - (DIMENSIONS.columns + 1) * DIMENSIONS.columnGap) / DIMENSIONS.columns;
     const height = (canvas.height - (DIMENSIONS.rows + 1) * DIMENSIONS.rowGap) / DIMENSIONS.rows;
 
     const ctx = canvas.getContext("2d");
 
+    let index = 0;
+
     if (ctx) {
       for (let r = 0; r < DIMENSIONS.rows; r++) {
         for (let c = 0; c < DIMENSIONS.columns; c++) {
+          const TYPE = TYPE_SEQUENCE[index];
+
+          if (TYPE === undefined) continue;
+
           // const x = c * width;
           // const y = r * (height + DIMENSIONS.rowGap * r );
 
@@ -239,12 +315,12 @@ function App() {
             const svg = await new Promise<string>((resolve, reject) => {
               Potrace.trace(
                 cellCanvas.toDataURL(),
-                {
-                  threshold: 200,
-                  turdSize: 6, // removes small noise
-                  optTolerance: 0.2,
-                  // turdPolicy: "minority",
-                },
+                // {
+                //   threshold: 100,
+                //   turdSize: 6, // removes small noise
+                //   optTolerance: 0.2,
+                //   // turdPolicy: "minority",
+                // },
                 (error, svg) => {
                   if (error) reject(error);
                   else if (svg) resolve(svg);
@@ -252,14 +328,34 @@ function App() {
               );
             });
 
-            cells.push(svg);
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(svg, "image/svg+xml");
+
+            const pathElement = doc.getElementsByTagName("path")[0];
+            const d = pathElement.getAttribute("d");
+
+            const element = doc.getElementsByTagName("svg")[0];
+
+            if (element !== null) {
+              const viewBox = element.getAttribute("viewBox").split(" ").map(Number);
+            }
+
+            cells.push({
+              type: TYPE,
+              svg: svg,
+            });
+            // cells.push(cellCanvas.toDataURL());
           }
+
+          index = index + 1;
         }
       }
     }
 
     setCells(cells);
   };
+
+  const arrayToFont = () => {};
 
   return (
     <div className="min-h-screen w-full flex flex-col items-center justify-center p-6 bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black overflow-hidden selection:bg-blue-500/30">
@@ -307,7 +403,8 @@ function App() {
 
           <div className="grid grid-cols-8 gap-3">
             {cells.map((cell, idx) => {
-              return <div className="bg-white rounded" dangerouslySetInnerHTML={{ __html: cell }} key={idx} />;
+              // return <img className="bg-white rounded" src={cell} key={idx} />;
+              return <div className="bg-white rounded" dangerouslySetInnerHTML={{ __html: cell.svg }} key={idx} />;
             })}
           </div>
         </main>
