@@ -94,7 +94,8 @@ function App() {
   const processImage = () => {
     setIsProcessing(true);
     const img = new Image();
-    img.src = "/IMG_20260228_020759.jpg.jpeg";
+    // img.src = "/IMG_20260228_020759.jpg.jpeg";
+    img.src = "/scan.jpg";
     img.onload = () => {
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -293,59 +294,37 @@ function App() {
         for (let c = 0; c < DIMENSIONS.columns; c++) {
           const TYPE = TYPE_SEQUENCE[index];
 
-          if (TYPE === undefined) continue;
+          if (TYPE) {
+            const x = (c + 1) * DIMENSIONS.columnGap + c * width;
+            const y = (r + 1) * DIMENSIONS.rowGap + r * height;
+
+            const cellCanvas = document.createElement("canvas");
+
+            cellCanvas.width = width;
+            cellCanvas.height = height;
+
+            const cellCtx = cellCanvas.getContext("2d");
+
+            if (cellCtx) {
+              cellCtx.drawImage(canvas, x, y + 2, width - 2, height - 2, 0, 0, width, height);
+              //  const image =  cellCtx.getImageData(0, 0, width, height);
+
+              const svg = await new Promise<string>((resolve, reject) => {
+                Potrace.trace(cellCanvas.toDataURL(), (error, svg) => {
+                  if (error) reject(error);
+                  else if (svg) resolve(svg);
+                });
+              });
+
+              cells.push({
+                type: TYPE,
+                svg: svg,
+              });
+            }
+          }
 
           // const x = c * width;
           // const y = r * (height + DIMENSIONS.rowGap * r );
-
-          const x = (c + 1) * DIMENSIONS.columnGap + c * width;
-          const y = (r + 1) * DIMENSIONS.rowGap + r * height;
-
-          const cellCanvas = document.createElement("canvas");
-
-          cellCanvas.width = width;
-          cellCanvas.height = height;
-
-          const cellCtx = cellCanvas.getContext("2d");
-
-          if (cellCtx) {
-            cellCtx.drawImage(canvas, x, y + 2, width - 2, height - 2, 0, 0, width, height);
-            //  const image =  cellCtx.getImageData(0, 0, width, height);
-
-            const svg = await new Promise<string>((resolve, reject) => {
-              Potrace.trace(
-                cellCanvas.toDataURL(),
-                // {
-                //   threshold: 100,
-                //   turdSize: 6, // removes small noise
-                //   optTolerance: 0.2,
-                //   // turdPolicy: "minority",
-                // },
-                (error, svg) => {
-                  if (error) reject(error);
-                  else if (svg) resolve(svg);
-                },
-              );
-            });
-
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(svg, "image/svg+xml");
-
-            const pathElement = doc.getElementsByTagName("path")[0];
-            const d = pathElement.getAttribute("d");
-
-            const element = doc.getElementsByTagName("svg")[0];
-
-            if (element !== null) {
-              const viewBox = element.getAttribute("viewBox").split(" ").map(Number);
-            }
-
-            cells.push({
-              type: TYPE,
-              svg: svg,
-            });
-            // cells.push(cellCanvas.toDataURL());
-          }
 
           index = index + 1;
         }
@@ -355,7 +334,176 @@ function App() {
     setCells(cells);
   };
 
-  const arrayToFont = () => {};
+  const arrayToFont = (
+    cells: {
+      svg: string;
+      type: string;
+    }[],
+  ) => {
+    // Return early if no character cells have been processed
+    if (cells.length === 0) return;
+
+    // This array will hold the 'Glyph' objects (representations of characters) for our font
+    const glyphs: opentype.Glyph[] = [];
+
+    // 1. Add .notdef glyph: This is the fallback character shown when a font lacks a specific character
+    glyphs.push(
+      new opentype.Glyph({
+        name: ".notdef",
+        unicode: 0,
+        advanceWidth: 600,
+        path: new opentype.Path(),
+      }),
+    );
+
+    // Filter out cells that don't contains actual SVG path data to avoid processing empty cells
+    const validCells = cells.filter((c) => c.svg && c.svg.includes("<path"));
+
+    for (let index = 0; index < validCells.length; index++) {
+      const cell = validCells[index];
+      // Use DOMParser to extract path and viewBox details from the raw SVG string
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(cell.svg, "image/svg+xml");
+      const pathElement = doc.getElementsByTagName("path")[0];
+      const svgElement = doc.getElementsByTagName("svg")[0];
+      const d = pathElement.getAttribute("d");
+
+      // Skip this character if it has no path data
+      if (!d) continue;
+
+      let svgHeight = 100;
+      // Get the height of the original SVG to calculate the scale needed for the font coordinate system
+      const viewBox = svgElement.getAttribute("viewBox");
+      if (viewBox) {
+        const parts = viewBox.split(/\s+/).map(Number);
+        if (parts.length === 4) svgHeight = parts[3];
+      } else {
+        const h = svgElement.getAttribute("height");
+        if (h) svgHeight = parseFloat(h);
+      }
+
+      // Scale factor to map the handwriting SVG (height variable) to the font's Em square (800 units)
+      const scale = 800 / svgHeight;
+
+      // First pass: Find bounding box of the Raw SVG path to trim horizontal whitespace
+      // We need this because scanned characters might have empty space on their left/right
+      let minX = Infinity,
+        maxX = -Infinity;
+      let minY = Infinity,
+        maxY = -Infinity;
+
+      svgpath(d)
+        .abs()
+        .iterate((seg) => {
+          const cmd = seg[0];
+          // Track the boundaries (min/max X and Y) for all path segments (Lines, Curves, etc.)
+          if (cmd === "M" || cmd === "L") {
+            minX = Math.min(minX, seg[1]);
+            maxX = Math.max(maxX, seg[1]);
+            minY = Math.min(minY, seg[2]);
+            maxY = Math.max(maxY, seg[2]);
+          } else if (cmd === "C") {
+            minX = Math.min(minX, seg[1], seg[3], seg[5]);
+            maxX = Math.max(maxX, seg[1], seg[3], seg[5]);
+            minY = Math.min(minY, seg[2], seg[4], seg[6]);
+            maxY = Math.max(maxY, seg[2], seg[4], seg[6]);
+          } else if (cmd === "Q") {
+            minX = Math.min(minX, seg[1], seg[3]);
+            maxX = Math.max(maxX, seg[1], seg[3]);
+            minY = Math.min(minY, seg[2], seg[4]);
+            maxY = Math.max(maxY, seg[2], seg[4]);
+          }
+        });
+
+      // If no geometry found, skip
+      if (minX === Infinity) continue;
+
+      // Second pass: Transform the SVG path to Font Space
+      // 1. Shift X so the character starts at 0 (removes left padding)
+      // 2. Scale up (to match unitsPerEm) and flip Y (SVG uses top-down Y, Fonts use bottom-up Y)
+      // 3. Move Y so it sits correctly relative to the baseline
+      const transPath = svgpath(d)
+        .abs()
+        .translate(-minX, 0) // Trim left padding relative to character geometry
+        .scale(scale, -scale) // Apply font scaling and vertical flip
+        .translate(0, 800); // Position character above the baseline
+
+      const path = new opentype.Path();
+      let curX = 0,
+        curY = 0;
+
+      // Translate the transformed SVG path strings back into opentype.js Path operations
+      transPath.iterate((seg) => {
+        const cmd = seg[0];
+        if (cmd === "M") {
+          path.moveTo(seg[1], seg[2]);
+          [curX, curY] = [seg[1], seg[2]];
+        } else if (cmd === "L") {
+          path.lineTo(seg[1], seg[2]);
+          [curX, curY] = [seg[1], seg[2]];
+        } else if (cmd === "C") {
+          path.curveTo(seg[1], seg[2], seg[3], seg[4], seg[5], seg[6]);
+          [curX, curY] = [seg[5], seg[6]];
+        } else if (cmd === "Q") {
+          path.quadTo(seg[1], seg[2], seg[3], seg[4]);
+          [curX, curY] = [seg[3], seg[4]];
+        } else if (cmd === "Z") {
+          path.close();
+        } else if (cmd === "H") {
+          path.lineTo(seg[1], curY);
+          curX = seg[1];
+        } else if (cmd === "V") {
+          path.lineTo(curX, seg[1]);
+          curY = seg[1];
+        }
+      });
+
+      // Calculate the specific advance width for this character based on its geometry
+      const charWidth = (maxX - minX) * scale;
+      glyphs.push(
+        new opentype.Glyph({
+          name: cell.type,
+          unicode: cell.type.charCodeAt(0),
+          advanceWidth: Math.round(charWidth + 80), // Set the spacing for the character
+          path,
+        }),
+      );
+    }
+
+    // Assemble all processed glyphs into a complete Font object
+    const font = new opentype.Font({
+      familyName: "HandwrittenFont",
+      styleName: "Regular",
+      unitsPerEm: 1000,
+      ascender: 800,
+      descender: -200,
+      glyphs,
+    });
+
+    // Generate the binary buffer of the font file
+    const buffer = font.toArrayBuffer();
+    // Create a Blob from the buffer and generate a URL for it to be accessible as a resource
+    const blob = new Blob([buffer], { type: "font/ttf" });
+    const url = URL.createObjectURL(blob);
+
+    // Apply the newly generated font to the browser's document so the preview area updates immediately
+    const fontFace = new FontFace("HandwrittenFont", buffer);
+    fontFace.load().then((loadedFace) => {
+      document.fonts.add(loadedFace);
+      const previewText = document.getElementById("font-preview-text");
+      if (previewText) {
+        previewText.style.fontFamily = "HandwrittenFont";
+      }
+    });
+
+    // Trigger an automatic download of the .ttf file for the user
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "HandwrittenFont.ttf";
+    a.click();
+    // Clean up the URL object to free up memory
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
 
   return (
     <div className="min-h-screen w-full flex flex-col items-center justify-center p-6 bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black overflow-hidden selection:bg-blue-500/30">
@@ -427,11 +575,31 @@ function App() {
             </button>
 
             <button
-              disabled={true}
-              className="px-10 py-4 bg-slate-800 text-slate-400 font-bold rounded-2xl border border-slate-700 cursor-not-allowed opacity-50">
-              Download Font (Coming Soon)
+              onClick={() => arrayToFont(cells)}
+              disabled={cells.length === 0}
+              className="px-10 py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-2xl shadow-xl shadow-emerald-500/20 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              Download Font
             </button>
           </div>
+
+          {cells.length > 0 && (
+            <div className="w-full max-w-2xl bg-slate-900/50 border border-slate-800 rounded-xl p-6 flex flex-col gap-4 animate-in fade-in slide-in-from-bottom-2 duration-500">
+              <div className="flex items-center justify-between">
+                <h3 className="text-slate-300 font-medium text-sm">Live Font Preview</h3>
+                <span className="text-[10px] bg-slate-800 text-slate-500 px-2 py-0.5 rounded uppercase font-bold tracking-tighter">HandwrittenFont.ttf</span>
+              </div>
+              <textarea
+                id="font-preview-text"
+                placeholder="Type here to test your font..."
+                defaultValue="The quick brown fox jumps over the lazy dog."
+                className="w-full bg-transparent border-none text-4xl text-white resize-none focus:outline-none placeholder:text-slate-700 min-h-[100px]"
+                style={{ fontFamily: "inherit" }}
+              />
+            </div>
+          )}
 
           <div className="flex items-center gap-8 text-slate-500 text-sm">
             <span className="flex items-center gap-2">
