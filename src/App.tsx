@@ -72,547 +72,764 @@ const TYPE_SEQUENCE = [
   "q",
 ];
 
+type Step = "idle" | "grayscale" | "threshold" | "edges" | "warped" | "extracting" | "done";
+
+interface Glyph {
+  type: string;
+  svg: string;
+  originalImg: string;
+}
+interface ProcessingSnapshot {
+  name: string;
+  image: string;
+}
+
+// ─── Winding-order utilities ───────────────────────────────────────────────
+
+/** Shoelace signed area. Positive → CCW (Y-up). Negative → CW. */
+function signedArea(pts: { x: number; y: number }[]): number {
+  let a = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i],
+      q = pts[(i + 1) % pts.length];
+    a += p.x * q.y - q.x * p.y;
+  }
+  return a / 2;
+}
+
+function flattenSegments(segs: any[]): { x: number; y: number }[] {
+  const pts: { x: number; y: number }[] = [];
+  let cx = 0,
+    cy = 0;
+  for (const s of segs) {
+    switch (s[0]) {
+      case "M":
+        cx = s[1];
+        cy = s[2];
+        pts.push({ x: cx, y: cy });
+        break;
+      case "L":
+        cx = s[1];
+        cy = s[2];
+        pts.push({ x: cx, y: cy });
+        break;
+      case "H":
+        cx = s[1];
+        pts.push({ x: cx, y: cy });
+        break;
+      case "V":
+        cy = s[1];
+        pts.push({ x: cx, y: cy });
+        break;
+      case "C":
+        pts.push({ x: (cx + s[5]) / 2, y: (cy + s[6]) / 2 });
+        cx = s[5];
+        cy = s[6];
+        pts.push({ x: cx, y: cy });
+        break;
+      case "Q":
+        cx = s[3];
+        cy = s[4];
+        pts.push({ x: cx, y: cy });
+        break;
+    }
+  }
+  return pts;
+}
+
+/**
+ * Reverse a contour while PRESERVING Bezier curves.
+ *
+ * Why curves must be preserved:
+ *   After the Y-flip transform, winding is inverted, so we call this function
+ *   to correct it. The previous implementation sampled only endpoint 'anchors'
+ *   and emitted LineTo for everything — turning smooth ovals into polygons and
+ *   causing the "non-continuous" jagged look in O, P, Q, etc.
+ *
+ * Bezier reversal rules (mathematically correct):
+ *   Cubic  "C c1x c1y c2x c2y ex ey" reversed from [start] →
+ *          "C c2x c2y c1x c1y start.x start.y"  (swap control points)
+ *   Quad   "Q cx cy ex ey" reversed from [start] →
+ *          "Q cx cy start.x start.y"             (control point unchanged)
+ *   Linear "L/H/V …" reversed from [start] →
+ *          "L start.x start.y"
+ */
+function reverseContour(segs: any[]): any[] {
+  if (segs.length <= 1) return segs;
+
+  type PS = { type: string; start: [number, number]; args: number[] };
+  const parsed: PS[] = [];
+  let cx = 0,
+    cy = 0;
+
+  for (const s of segs) {
+    const type = s[0] as string;
+    const args = s.slice(1) as number[];
+    parsed.push({ type, start: [cx, cy], args });
+    // Track current pen position
+    if (type === "M" || type === "L") {
+      cx = args[0];
+      cy = args[1];
+    } else if (type === "H") {
+      cx = args[0];
+    } else if (type === "V") {
+      cy = args[0];
+    } else if (type === "C") {
+      cx = args[4];
+      cy = args[5];
+    } else if (type === "Q") {
+      cx = args[2];
+      cy = args[3];
+    }
+    // Z: in our tracker cx/cy stays as the last drawing endpoint — correct
+  }
+
+  // The new M starts at wherever the last drawing command ended (cx, cy)
+  const out: any[] = [["M", cx, cy]];
+
+  for (let i = parsed.length - 1; i >= 0; i--) {
+    const { type, start, args } = parsed[i];
+    if (type === "M" || type === "Z") continue;
+
+    if (type === "L" || type === "H" || type === "V") {
+      // Reversed line: just draw back to the segment's start point
+      out.push(["L", start[0], start[1]]);
+    } else if (type === "C") {
+      // Cubic: endpoint becomes start, swap C1 ↔ C2
+      // Original: C args[0] args[1]  args[2] args[3]  args[4] args[5]
+      //              c1x     c1y      c2x     c2y      ex      ey
+      // Reversed: C args[2] args[3]  args[0] args[1]  start.x start.y
+      out.push(["C", args[2], args[3], args[0], args[1], start[0], start[1]]);
+    } else if (type === "Q") {
+      // Quadratic: control point is invariant under reversal, endpoint → start
+      // Original: Q args[0] args[1]  args[2] args[3]
+      //              cx       cy      ex      ey
+      // Reversed: Q args[0] args[1]  start.x start.y
+      out.push(["Q", args[0], args[1], start[0], start[1]]);
+    }
+  }
+
+  out.push(["Z"]);
+  return out;
+}
+
+function splitSubPaths(d: string): string[] {
+  const tokens = d.trim().split(/(?=[Mm])/);
+  const parts = tokens.map((t) => t.trim()).filter(Boolean);
+  return parts.length ? parts : [d];
+}
+
+function emitToPath(path: opentype.Path, segs: any[]): void {
+  let cx = 0,
+    cy = 0;
+  for (const s of segs) {
+    switch (s[0]) {
+      case "M":
+        path.moveTo(s[1], s[2]);
+        cx = s[1];
+        cy = s[2];
+        break;
+      case "L":
+        path.lineTo(s[1], s[2]);
+        cx = s[1];
+        cy = s[2];
+        break;
+      case "C":
+        path.curveTo(s[1], s[2], s[3], s[4], s[5], s[6]);
+        cx = s[5];
+        cy = s[6];
+        break;
+      case "Q":
+        path.quadTo(s[1], s[2], s[3], s[4]);
+        cx = s[3];
+        cy = s[4];
+        break;
+      case "Z":
+        path.close();
+        break;
+      case "H":
+        path.lineTo(s[1], cy);
+        cx = s[1];
+        break;
+      case "V":
+        path.lineTo(cx, s[1]);
+        cy = s[1];
+        break;
+    }
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+
 function App() {
-  const [cells, setCells] = useState<{ type: string; svg: string }[]>([]);
   const [cv, setCV] = useState<typeof opencv | null>(null);
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [currentStep, setCurrentStep] = useState<Step>("idle");
   const [isProcessing, setIsProcessing] = useState(false);
+  const [glyphs, setGlyphs] = useState<Glyph[]>([]);
+  const [processedImage, setProcessedImage] = useState<string | null>(null);
+  const [history, setHistory] = useState<ProcessingSnapshot[]>([]);
+  const [appliedFontName, setAppliedFontName] = useState<string>("inherit");
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const inventoryRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    // Check if OpenCV is already initialized
-    opencv.onRuntimeInitialized = () => {
-      setCV(opencv);
-    };
+    opencv.onRuntimeInitialized = () => setCV(opencv);
   }, []);
 
   useEffect(() => {
-    if (cv && canvasRef.current) {
-      processImage();
-    }
-  }, [cv]);
+    if (isProcessing && glyphs.length > 0) window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  }, [glyphs.length, isProcessing]);
 
-  const processImage = () => {
-    setIsProcessing(true);
-    const img = new Image();
-    // img.src = "/IMG_20260228_020759.jpg.jpeg";
-    img.src = "/scan.jpg";
-    img.onload = () => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-
-      // Maintain aspect ratio while fitting in a reasonable size
-      const maxDim = 1200;
-      let width = img.width;
-      let height = img.height;
-      // if (width > maxDim || height > maxDim) {
-      //   if (width > height) {
-      //     height *= maxDim / width;
-      //     width = maxDim;
-      //   } else {
-      //     width *= maxDim / height;
-      //     height = maxDim;
-      //   }
-      // }
-
-      canvas.width = width;
-      canvas.height = height;
-      ctx.drawImage(img, 0, 0, width, height);
-
-      detectMarkers(canvas);
-      setIsProcessing(false);
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImageFile(file);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const url = ev.target?.result as string;
+      setProcessedImage(url);
+      setHistory([{ name: "Source", image: url }]);
     };
-    img.onerror = () => {
-      console.error("Failed to load image");
-      setIsProcessing(false);
-    };
+    reader.readAsDataURL(file);
+    setCurrentStep("idle");
+    setGlyphs([]);
+    setAppliedFontName("inherit");
   };
 
-  async function detectMarkers(canvas: HTMLCanvasElement) {
-    if (!cv) return;
+  const reset = () => {
+    setImageFile(null);
+    setGlyphs([]);
+    setHistory([]);
+    setCurrentStep("idle");
+    setAppliedFontName("inherit");
+    setProcessedImage(null);
+  };
+
+  const processImage = async () => {
+    if (!cv || !imageFile || !canvasRef.current) return;
+    setIsProcessing(true);
+    setGlyphs([]);
+    setAppliedFontName("inherit");
+    setHistory((prev) => [prev[0]]);
+
+    const img = new Image();
+    img.src = history[0].image;
+    await new Promise((r) => (img.onload = r));
+
+    const canvas = canvasRef.current;
+    canvas.width = img.width;
+    canvas.height = img.height;
+    canvas.getContext("2d")!.drawImage(img, 0, 0);
     const src = cv.imread(canvas);
+
+    const snap = async (step: Step, mat: any, name: string, delay = 700) => {
+      setCurrentStep(step);
+      cv.imshow(canvas, mat);
+      const url = canvas.toDataURL();
+      setProcessedImage(url);
+      setHistory((p) => [...p, { name, image: url }]);
+      await new Promise((r) => setTimeout(r, delay));
+    };
+
     const gray = new cv.Mat();
-    const thresh = new cv.Mat();
-    const edges = new cv.Mat();
-    const contours = new cv.MatVector();
-    const hierarchy = new cv.Mat();
-
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    await snap("grayscale", gray, "Grayscale");
 
-    cv.imshow(canvas, gray);
+    const thresh = new cv.Mat();
+    cv.threshold(gray, thresh, 120, 255, cv.THRESH_BINARY_INV);
+    await snap("threshold", thresh, "Threshold");
 
-    await new Promise((resolve) => {
-      setTimeout(resolve, 500);
-    });
-
-    // cv.threshold(gray, thresh, 120, 255, cv.THRESH_BINARY_INV);
-
-    // cv.imshow(canvas, thresh);
-
-    // await new Promise((resolve) => {
-    //   setTimeout(resolve, 500);
-    // });
-
+    const edges = new cv.Mat();
     cv.Canny(gray, edges, 50, 150);
+    await snap("edges", edges, "Edge Map");
 
-    cv.imshow(canvas, edges);
-
-    await new Promise((resolve) => {
-      setTimeout(resolve, 500);
-    });
-
-    cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-    const EDGE_POINTERS: opencv.Rect[] = [];
-
+    const contours = new cv.MatVector(),
+      hier = new cv.Mat();
+    cv.findContours(edges, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const rects: opencv.Rect[] = [];
     for (let i = 0; i < contours.size(); i++) {
-      const cnt = contours.get(i);
-      const peri = cv.arcLength(cnt, true);
-      const approx = new cv.Mat();
-      cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
-
+      const cnt = contours.get(i),
+        approx = new cv.Mat();
+      cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
       if (approx.rows === 4 && cv.isContourConvex(approx)) {
-        const rect = cv.boundingRect(cnt);
-
-        const aspect = rect.width / rect.height;
-
-        if (rect.width > 25 && aspect > 0.8 && aspect < 1.4) {
-          // console.log(rect, aspect);
-          // cv.rectangle(src, new cv.Point(rect.x, rect.y), new cv.Point(rect.x + rect.width, rect.y + rect.height), new cv.Scalar(59, 130, 246, 255), 3);
-          EDGE_POINTERS.push(rect);
-        }
+        const r = cv.boundingRect(cnt);
+        if (r.width > 20 && r.width < 140) rects.push(r);
       }
       approx.delete();
     }
 
-    cv.imshow(canvas, src);
+    let warped = src.clone();
 
-    await new Promise((resolve) => {
-      setTimeout(resolve, 500);
-    });
+    if (rects.length === 4) {
+      const tl = rects.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
+      const tr = rects.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
+      const br = rects.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
+      const bl = rects.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
+      const s = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y + tl.height, tr.x + tr.width, tr.y + tr.height, br.x + br.width, br.y, bl.x, bl.y]);
+      const d = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, 800, 0, 800, 1000, 0, 1000]);
+      const M = cv.getPerspectiveTransform(s, d);
+      warped = new cv.Mat();
+      cv.warpPerspective(src, warped, M, new cv.Size(800, 1000));
+      M.delete();
+      s.delete();
+      d.delete();
+    }
+    await snap("warped", warped, "Perspective");
 
-    // if (EDGE_POINTERS.length) return;
+    setCurrentStep("extracting");
+    const DIM = { rows: 8, cols: 8, rGap: 40, cGap: 14 };
+    const w = (canvas.width - (DIM.cols + 1) * DIM.cGap) / DIM.cols;
+    const h = (canvas.height - (DIM.rows + 1) * DIM.rGap) / DIM.rows;
+    let idx = 0;
+    const extracted: Glyph[] = [];
 
-    console.log(EDGE_POINTERS);
-
-    if (EDGE_POINTERS.length === 4) {
-      const tl = EDGE_POINTERS.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
-
-      const tr = EDGE_POINTERS.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
-
-      const br = EDGE_POINTERS.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
-
-      const bl = EDGE_POINTERS.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
-
-      const width = 800; // Math.floor(maxWidth);
-      const height = 1000; // Math.floor(maxHeight);
-
-      const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y + tl.height, tr.x + tr.width, tr.y + tr.height, br.x + br.width, br.y, bl.x, bl.y]);
-
-      const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, width, 0, width, height, 0, height]);
-
-      // 9️⃣ Perspective transform
-      const M = cv.getPerspectiveTransform(srcTri, dstTri);
-      const warped = new cv.Mat();
-
-      cv.warpPerspective(src, warped, M, new cv.Size(width, height));
-
-      // 10️⃣ Optional: crop inside margin
-      // const margin = 40;
-      // const cropped = warped.roi(new cv.Rect(margin, margin, width - 2 * margin, height - 2 * margin));
-
-      // Show result
-      cv.imshow(canvas, warped);
+    for (let r = 0; r < DIM.rows; r++) {
+      for (let c = 0; c < DIM.cols; c++) {
+        const type = TYPE_SEQUENCE[idx++];
+        if (type) {
+          const x = (c + 1) * DIM.cGap + c * w,
+            y = (r + 1) * DIM.rGap + r * h;
+          const cc = document.createElement("canvas");
+          cc.width = w * 2.5;
+          cc.height = h * 2.5;
+          cc.getContext("2d")!.drawImage(canvas, x, y + 2, w - 2, h - 2, 0, 0, w * 2.5, h * 2.5);
+          const originalImg = cc.toDataURL("image/png");
+          const svg = await new Promise<string>((res) => Potrace.trace(originalImg, (_, r) => res(r || "")));
+          if (svg) {
+            const g = { type, svg, originalImg };
+            extracted.push(g);
+            setGlyphs((p) => [...p, g]);
+            await new Promise((r) => setTimeout(r, 20));
+          }
+        }
+      }
     }
 
-    // cv.imshow(canvas, src);
-
-    src.delete();
+    setCurrentStep("done");
+    setIsProcessing(false);
     gray.delete();
     thresh.delete();
     edges.delete();
     contours.delete();
-    hierarchy.delete();
-
-    cleanImage(canvas);
-  }
-
-  const cleanImage = (canvas: HTMLCanvasElement) => {
-    if (!cv) return;
-
-    // const src = cv.imread(canvas);
-    // const gray = new cv.Mat();
-    // const denoised = new cv.Mat();
-    // const thresh = new cv.Mat();
-    // const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-
-    // 1️⃣ Grayscale
-    // cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-    // 2️⃣ Strong noise reduction (better than Gaussian)
-    // cv.medianBlur(gray, denoised, 5);
-
-    // 3️⃣ Otsu threshold (automatic)
-    // cv.threshold(denoised, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-
-    // 4️⃣ Remove small black specks
-    // cv.morphologyEx(gray, thresh, cv.MORPH_OPEN, kernel);
-
-    // 5️⃣ Optional: Remove tiny connected components
-    // removeSmallComponents(thresh, 50);
-
-    // cv.imshow(canvas, src);
-
-    // src.delete();
-    // gray.delete();
-    // denoised.delete();
-    // kernel.delete();
-
-    spliter(canvas);
+    hier.delete();
+    warped.delete();
+    src.delete();
+    setTimeout(() => {
+      applyGeneratedFont(extracted);
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    }, 400);
   };
 
-  const spliter = async (canvas: HTMLCanvasElement) => {
-    const DIMENSIONS = {
-      rows: 8,
-      columns: 8,
-      rowGap: 40,
-      columnGap: 4,
-    } as const;
-
-    const cells: { svg: string; type: string }[] = [];
-
-    const width = (canvas.width - (DIMENSIONS.columns + 1) * DIMENSIONS.columnGap) / DIMENSIONS.columns;
-    const height = (canvas.height - (DIMENSIONS.rows + 1) * DIMENSIONS.rowGap) / DIMENSIONS.rows;
-
-    const ctx = canvas.getContext("2d");
-
-    let index = 0;
-
-    if (ctx) {
-      for (let r = 0; r < DIMENSIONS.rows; r++) {
-        for (let c = 0; c < DIMENSIONS.columns; c++) {
-          const TYPE = TYPE_SEQUENCE[index];
-
-          if (TYPE) {
-            const x = (c + 1) * DIMENSIONS.columnGap + c * width;
-            const y = (r + 1) * DIMENSIONS.rowGap + r * height;
-
-            const cellCanvas = document.createElement("canvas");
-
-            cellCanvas.width = width;
-            cellCanvas.height = height;
-
-            const cellCtx = cellCanvas.getContext("2d");
-
-            if (cellCtx) {
-              cellCtx.drawImage(canvas, x, y + 2, width - 2, height - 2, 0, 0, width, height);
-              //  const image =  cellCtx.getImageData(0, 0, width, height);
-
-              const svg = await new Promise<string>((resolve, reject) => {
-                Potrace.trace(cellCanvas.toDataURL(), (error, svg) => {
-                  if (error) reject(error);
-                  else if (svg) resolve(svg);
-                });
-              });
-
-              cells.push({
-                type: TYPE,
-                svg: svg,
-              });
-            }
-          }
-
-          // const x = c * width;
-          // const y = r * (height + DIMENSIONS.rowGap * r );
-
-          index = index + 1;
-        }
-      }
-    }
-
-    setCells(cells);
-  };
-
-  const arrayToFont = (
-    cells: {
-      svg: string;
-      type: string;
-    }[],
-  ) => {
-    // Return early if no character cells have been processed
-    if (cells.length === 0) return;
-
-    // This array will hold the 'Glyph' objects (representations of characters) for our font
-    const glyphs: opentype.Glyph[] = [];
-
-    // 1. Add .notdef glyph: This is the fallback character shown when a font lacks a specific character
-    glyphs.push(
-      new opentype.Glyph({
-        name: ".notdef",
-        unicode: 0,
-        advanceWidth: 600,
-        path: new opentype.Path(),
-      }),
-    );
-
-    // Filter out cells that don't contains actual SVG path data to avoid processing empty cells
-    const validCells = cells.filter((c) => c.svg && c.svg.includes("<path"));
-
-    for (let index = 0; index < validCells.length; index++) {
-      const cell = validCells[index];
-      // Use DOMParser to extract path and viewBox details from the raw SVG string
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(cell.svg, "image/svg+xml");
-      const pathElement = doc.getElementsByTagName("path")[0];
-      const svgElement = doc.getElementsByTagName("svg")[0];
-      const d = pathElement.getAttribute("d");
-
-      // Skip this character if it has no path data
-      if (!d) continue;
-
-      let svgHeight = 100;
-      // Get the height of the original SVG to calculate the scale needed for the font coordinate system
-      const viewBox = svgElement.getAttribute("viewBox");
-      if (viewBox) {
-        const parts = viewBox.split(/\s+/).map(Number);
-        if (parts.length === 4) svgHeight = parts[3];
-      } else {
-        const h = svgElement.getAttribute("height");
-        if (h) svgHeight = parseFloat(h);
-      }
-
-      // Scale factor to map the handwriting SVG (height variable) to the font's Em square (800 units)
-      const scale = 800 / svgHeight;
-
-      // First pass: Find bounding box of the Raw SVG path to trim horizontal whitespace
-      // We need this because scanned characters might have empty space on their left/right
+  const getFontBuffer = (gs: Glyph[]): ArrayBuffer | null => {
+    if (!gs.length) return null;
+    const ogs: opentype.Glyph[] = [new opentype.Glyph({ name: ".notdef", unicode: 0, advanceWidth: 600, path: new opentype.Path() })];
+    gs.forEach((g) => {
+      const doc = new DOMParser().parseFromString(g.svg, "image/svg+xml");
+      const rawD = Array.from(doc.getElementsByTagName("path"))
+        .map((p) => p.getAttribute("d") || "")
+        .filter(Boolean)
+        .join(" ");
+      if (!rawD) return;
+      const svgEl = doc.getElementsByTagName("svg")[0];
+      const vb = svgEl?.getAttribute("viewBox")?.split(/\s+/).map(Number);
+      const svgH = vb && vb.length === 4 ? vb[3] : 100;
+      const scale = 800 / svgH;
       let minX = Infinity,
         maxX = -Infinity;
-      let minY = Infinity,
-        maxY = -Infinity;
-
-      svgpath(d)
+      svgpath(rawD)
         .abs()
-        .iterate((seg) => {
-          const cmd = seg[0];
-          // Track the boundaries (min/max X and Y) for all path segments (Lines, Curves, etc.)
-          if (cmd === "M" || cmd === "L") {
-            minX = Math.min(minX, seg[1]);
-            maxX = Math.max(maxX, seg[1]);
-            minY = Math.min(minY, seg[2]);
-            maxY = Math.max(maxY, seg[2]);
-          } else if (cmd === "C") {
-            minX = Math.min(minX, seg[1], seg[3], seg[5]);
-            maxX = Math.max(maxX, seg[1], seg[3], seg[5]);
-            minY = Math.min(minY, seg[2], seg[4], seg[6]);
-            maxY = Math.max(maxY, seg[2], seg[4], seg[6]);
-          } else if (cmd === "Q") {
-            minX = Math.min(minX, seg[1], seg[3]);
-            maxX = Math.max(maxX, seg[1], seg[3]);
-            minY = Math.min(minY, seg[2], seg[4]);
-            maxY = Math.max(maxY, seg[2], seg[4]);
-          }
+        .iterate((seg: any) => {
+          [seg[1], seg[3], seg[5]]
+            .filter((v: any) => typeof v === "number")
+            .forEach((x: number) => {
+              minX = Math.min(minX, x);
+              maxX = Math.max(maxX, x);
+            });
         });
+      if (minX === Infinity) return;
 
-      // If no geometry found, skip
-      if (minX === Infinity) continue;
-
-      // Second pass: Transform the SVG path to Font Space
-      // 1. Shift X so the character starts at 0 (removes left padding)
-      // 2. Scale up (to match unitsPerEm) and flip Y (SVG uses top-down Y, Fonts use bottom-up Y)
-      // 3. Move Y so it sits correctly relative to the baseline
-      const transPath = svgpath(d)
-        .abs()
-        .translate(-minX, 0) // Trim left padding relative to character geometry
-        .scale(scale, -scale) // Apply font scaling and vertical flip
-        .translate(0, 800); // Position character above the baseline
+      // ─── CRITICAL FIX ────────────────────────────────────────────────────
+      // Potrace outputs hole sub-paths as relative `m x y` commands, e.g.:
+      //   "M 100 200 C ... Z  m -50 -30 C ... Z"
+      // The second `m` is relative to the PREVIOUS sub-path's end point.
+      // Splitting rawD first and calling .abs() on each piece independently
+      // resolves that `m` against (0,0), placing the hole at the wrong position.
+      // Fix: absolutize the ENTIRE path string in one pass to resolve all
+      // relative commands with the correct accumulated current position,
+      // THEN split. Each piece now starts with an absolute `M`.
+      const absD = svgpath(rawD).abs().toString();
 
       const path = new opentype.Path();
-      let curX = 0,
-        curY = 0;
-
-      // Translate the transformed SVG path strings back into opentype.js Path operations
-      transPath.iterate((seg) => {
-        const cmd = seg[0];
-        if (cmd === "M") {
-          path.moveTo(seg[1], seg[2]);
-          [curX, curY] = [seg[1], seg[2]];
-        } else if (cmd === "L") {
-          path.lineTo(seg[1], seg[2]);
-          [curX, curY] = [seg[1], seg[2]];
-        } else if (cmd === "C") {
-          path.curveTo(seg[1], seg[2], seg[3], seg[4], seg[5], seg[6]);
-          [curX, curY] = [seg[5], seg[6]];
-        } else if (cmd === "Q") {
-          path.quadTo(seg[1], seg[2], seg[3], seg[4]);
-          [curX, curY] = [seg[3], seg[4]];
-        } else if (cmd === "Z") {
-          path.close();
-        } else if (cmd === "H") {
-          path.lineTo(seg[1], curY);
-          curX = seg[1];
-        } else if (cmd === "V") {
-          path.lineTo(curX, seg[1]);
-          curY = seg[1];
-        }
+      splitSubPaths(absD).forEach((subD, subIdx) => {
+        const transformed = svgpath(subD).abs().translate(-minX, 0).scale(scale, -scale).translate(0, 800);
+        const segs: any[] = [];
+        transformed.iterate((seg: any) => segs.push([...seg]));
+        if (!segs.length) return;
+        const area = signedArea(flattenSegments(segs));
+        const isOuter = subIdx === 0;
+        let final = segs;
+        if (isOuter && area > 0) final = reverseContour(segs);
+        else if (!isOuter && area < 0) final = reverseContour(segs);
+        emitToPath(path, final);
       });
-
-      // Calculate the specific advance width for this character based on its geometry
-      const charWidth = (maxX - minX) * scale;
-      glyphs.push(
-        new opentype.Glyph({
-          name: cell.type,
-          unicode: cell.type.charCodeAt(0),
-          advanceWidth: Math.round(charWidth + 80), // Set the spacing for the character
-          path,
-        }),
-      );
+      ogs.push(new opentype.Glyph({ name: g.type, unicode: g.type.charCodeAt(0), advanceWidth: Math.round((maxX - minX) * scale + 60), path }));
+    });
+    try {
+      return new opentype.Font({
+        familyName: "CustomFont",
+        styleName: "Regular",
+        unitsPerEm: 1000,
+        ascender: 800,
+        descender: -200,
+        glyphs: ogs,
+      }).toArrayBuffer();
+    } catch (e) {
+      console.error(e);
+      return null;
     }
-
-    // Assemble all processed glyphs into a complete Font object
-    const font = new opentype.Font({
-      familyName: "HandwrittenFont",
-      styleName: "Regular",
-      unitsPerEm: 1000,
-      ascender: 800,
-      descender: -200,
-      glyphs,
-    });
-
-    // Generate the binary buffer of the font file
-    const buffer = font.toArrayBuffer();
-    // Create a Blob from the buffer and generate a URL for it to be accessible as a resource
-    const blob = new Blob([buffer], { type: "font/ttf" });
-    const url = URL.createObjectURL(blob);
-
-    // Apply the newly generated font to the browser's document so the preview area updates immediately
-    const fontFace = new FontFace("HandwrittenFont", buffer);
-    fontFace.load().then((loadedFace) => {
-      document.fonts.add(loadedFace);
-      const previewText = document.getElementById("font-preview-text");
-      if (previewText) {
-        previewText.style.fontFamily = "HandwrittenFont";
-      }
-    });
-
-    // Trigger an automatic download of the .ttf file for the user
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "HandwrittenFont.ttf";
-    a.click();
-    // Clean up the URL object to free up memory
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  const applyGeneratedFont = async (gs: Glyph[]) => {
+    const buf = getFontBuffer(gs);
+    if (!buf) return;
+    const name = `UF_${Math.random().toString(36).substr(2, 8)}`;
+    try {
+      const f = await new FontFace(name, buf).load();
+      document.fonts.add(f);
+      setAppliedFontName(name);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const downloadTTF = () => {
+    const buf = getFontBuffer(glyphs);
+    if (!buf) return;
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([buf], { type: "font/ttf" })),
+      download: "custom-handwriting.ttf",
+    });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  };
+
+  // ── Derived state helpers ────────────────────────────────────────────
+  const isDone = currentStep === "done";
+  const isIdle = currentStep === "idle";
+
   return (
-    <div className="min-h-screen w-full flex flex-col items-center justify-center p-6 bg-[radial-gradient(ellipse_at_top,var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black overflow-hidden selection:bg-blue-500/30">
-      <div className="absolute top-0 left-0 w-full h-full opacity-20 pointer-events-none">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-blue-500 rounded-full blur-[120px]"></div>
-        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-purple-500 rounded-full blur-[120px]"></div>
-      </div>
-
-      <div className="z-10 w-full max-w-5xl flex flex-col gap-8 animate-in fade-in slide-in-from-bottom-4 duration-1000">
-        <header className="flex flex-col gap-3 items-center text-center">
-          <div className="px-3 py-1 bg-blue-500/10 border border-blue-500/20 rounded-full text-blue-400 text-xs font-semibold uppercase tracking-wider mb-2">
-            AI Powered
+    <div className="min-h-screen bg-slate-50 font-['Inter'] flex flex-col antialiased text-slate-800">
+      {/* ── Topbar ──────────────────────────────────────────────────────── */}
+      <header className="h-14 px-6 bg-white border-b border-slate-100 flex items-center justify-between sticky top-0 z-50">
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg bg-sky-500 flex items-center justify-center shadow-sm shadow-sky-500/40">
+            <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2.5"
+                d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"
+              />
+            </svg>
           </div>
-          <h1 className="text-5xl font-extrabold tracking-tight bg-linear-to-r from-blue-400 via-indigo-400 to-emerald-400 bg-clip-text text-transparent sm:text-6xl">
-            Font Sculptor
-          </h1>
-          <p className="text-slate-400 text-lg max-w-2xl leading-relaxed">
-            Bring your handwriting to the digital world. Our intelligent marker detection identifies your custom characters with precision.
-          </p>
-        </header>
+          <span className="font-bold text-slate-900 text-[15px] tracking-tight">FontForge</span>
+          <span className="text-[9px] font-semibold uppercase tracking-wider text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">Studio</span>
+        </div>
+        <div className={`flex items-center gap-1.5 text-xs font-medium ${cv ? "text-emerald-600" : "text-amber-500"}`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${cv ? "bg-emerald-500" : "bg-amber-400 animate-pulse"}`}></span>
+          {cv ? "Engine ready" : "Initializing…"}
+        </div>
+      </header>
 
-        <main className="relative group">
-          <div className="absolute -inset-1 bg-linear-to-r from-blue-600/50 to-emerald-600/50 rounded-2xl blur-xl opacity-20 group-hover:opacity-40 transition duration-1000"></div>
-          <div className="relative bg-slate-900/80 backdrop-blur-2xl border border-slate-800 rounded-2xl p-6 shadow-2xl overflow-hidden flex items-center justify-center min-h-[500px]">
-            {(!cv || isProcessing) && (
-              <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-slate-950/40 backdrop-blur-md gap-6 transition-all duration-500">
-                <div className="relative">
-                  <div className="w-16 h-16 border-4 border-blue-500/10 border-t-blue-500 rounded-full animate-spin"></div>
-                  <div className="absolute inset-0 w-16 h-16 border-4 border-emerald-500/10 border-b-emerald-500 rounded-full animate-spin [animation-duration:1.5s]"></div>
-                </div>
-                <div className="flex flex-col items-center gap-2">
-                  <p className="text-white font-semibold text-lg tracking-wide">{!cv ? "Waking up the AI..." : "Extracting Details..."}</p>
-                  <p className="text-slate-500 text-sm">{!cv ? "Loading OpenCV libraries" : "Analyzing document markers"}</p>
-                </div>
+      <main className="max-w-[1280px] mx-auto w-full px-6 py-12 flex flex-col gap-12">
+        {/* ── Section 1: Upload ──────────────────────────────────────────── */}
+        <section className="flex flex-col items-center gap-8">
+          <div className="text-center max-w-lg">
+            <h1 className="text-[28px] font-bold tracking-tight text-slate-900 leading-tight">Handwriting → Font File</h1>
+            <p className="mt-2 text-sm text-slate-500 leading-relaxed">
+              Upload an 8×8 character-grid scan. The pipeline extracts each glyph, vectorises it, fixes winding order, and compiles a valid .TTF.
+            </p>
+          </div>
+
+          <div className="w-full max-w-xl">
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              {/* Drop-zone */}
+              <div className="relative aspect-video bg-slate-50 group">
+                {!imageFile ? (
+                  <label className="absolute inset-0 flex flex-col items-center justify-center cursor-pointer hover:bg-sky-50/40 transition-colors duration-300">
+                    <div className="w-12 h-12 rounded-2xl bg-white border border-slate-200 flex items-center justify-center mb-3 shadow-sm group-hover:border-sky-300 group-hover:shadow-sky-100 group-hover:scale-105 transition-all duration-300">
+                      <svg className="w-5 h-5 text-slate-400 group-hover:text-sky-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+                        />
+                      </svg>
+                    </div>
+                    <p className="text-sm font-medium text-slate-500">
+                      Drop scan or <span className="text-sky-500 font-semibold">browse</span>
+                    </p>
+                    <p className="text-xs text-slate-400 mt-1">PNG / JPG · 8×8 character grid</p>
+                    <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+                  </label>
+                ) : (
+                  <>
+                    <img src={processedImage!} className="w-full h-full object-contain" alt="scan" />
+
+                    {/* Scanning overlay */}
+                    {isProcessing && (
+                      <div className="absolute inset-0 bg-white/60 backdrop-blur-[1px] flex items-center justify-center">
+                        <div className="absolute top-0 left-0 w-full h-[2px] bg-sky-500 shadow-[0_0_14px_rgba(14,165,233,0.9)] animate-scan z-10"></div>
+                        <div className="bg-white/95 px-5 py-2.5 rounded-full shadow-lg border border-slate-100 flex items-center gap-2.5">
+                          <div className="w-3 h-3 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
+                          <span className="text-xs font-semibold text-slate-700 capitalize">{currentStep}…</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Hover overlay when idle or done */}
+                    {!isProcessing && (
+                      <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end justify-center pb-4 gap-2.5">
+                        <label className="px-4 py-2 bg-white/90 backdrop-blur text-slate-700 text-xs font-semibold rounded-full cursor-pointer hover:bg-white transition active:scale-95 shadow-sm">
+                          Change
+                          <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+                        </label>
+                        {isIdle && (
+                          <button
+                            onClick={processImage}
+                            className="px-5 py-2 bg-sky-500 text-white text-xs font-semibold rounded-full shadow-lg hover:bg-sky-600 active:scale-95 transition">
+                            Run Analysis
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* Bottom action bar */}
+              <div className="px-5 py-4 border-t border-slate-100 flex gap-2.5">
+                {!imageFile ? (
+                  <label className="flex-1 py-2.5 rounded-xl border border-dashed border-slate-200 text-slate-400 text-sm font-medium flex items-center justify-center gap-2 cursor-pointer hover:border-sky-300 hover:text-sky-500 hover:bg-sky-50/50 transition-all">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
+                    </svg>
+                    Select scan
+                    <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+                  </label>
+                ) : isIdle ? (
+                  <button
+                    onClick={processImage}
+                    disabled={!cv}
+                    className="flex-1 py-2.5 rounded-xl bg-sky-500 text-white text-sm font-semibold flex items-center justify-center gap-2 hover:bg-sky-600 active:scale-[0.98] disabled:opacity-40 transition-all shadow-md shadow-sky-500/20">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                    Run Analysis
+                  </button>
+                ) : isDone ? (
+                  <button
+                    onClick={downloadTTF}
+                    className="flex-1 py-2.5 rounded-xl bg-slate-900 text-white text-sm font-semibold flex items-center justify-center gap-2 hover:bg-sky-600 active:scale-[0.98] transition-all shadow-md">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                    Download .TTF
+                  </button>
+                ) : (
+                  <div className="flex-1 py-2.5 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-center gap-2 text-sm text-slate-400">
+                    <div className="w-3.5 h-3.5 border-2 border-sky-400 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="capitalize font-medium">{currentStep}…</span>
+                  </div>
+                )}
+                {imageFile && (
+                  <button
+                    onClick={reset}
+                    className="px-4 py-2.5 rounded-xl border border-slate-200 text-slate-400 text-sm font-medium hover:border-rose-200 hover:text-rose-400 hover:bg-rose-50 active:scale-[0.98] transition-all">
+                    Reset
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ── Section 2: Processing Pipeline ────────────────────────────── */}
+        <section className="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-50 flex items-center justify-between">
+            <h2 className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Processing Pipeline</h2>
+            <div>
+              {isProcessing && (
+                <span className="text-[11px] font-semibold text-sky-500 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 bg-sky-500 rounded-full animate-pulse inline-block"></span>
+                  {currentStep}
+                </span>
+              )}
+              {isDone && (
+                <span className="text-[11px] font-semibold text-emerald-500 flex items-center gap-1">
+                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
+                  </svg>
+                  Complete — {glyphs.length} glyphs
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="p-6">
+            {history.length <= 1 && !isProcessing ? (
+              <div className="h-32 flex flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-slate-100 bg-slate-50/50">
+                <svg className="w-6 h-6 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 6h16M4 12h16M4 18h7" />
+                </svg>
+                <p className="text-xs text-slate-400">Pipeline stages will appear here as the neural logic runs.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                {history.map((snap, i) => (
+                  <div key={i} className="flex flex-col gap-4 group/stage cursor-default animate-fade-in-up" style={{ animationDelay: `${i * 100}ms` }}>
+                    <div className="relative overflow-hidden rounded-2xl border border-slate-100 bg-slate-100 shadow-sm group-hover/stage:border-sky-200 group-hover/stage:shadow-xl group-hover/stage:-translate-y-1 transition-all duration-500">
+                      <img
+                        src={snap.image}
+                        className="w-full aspect-[4/5] object-cover grayscale opacity-70 group-hover/stage:grayscale-0 group-hover/stage:opacity-100 transition-all duration-700"
+                        alt={snap.name}
+                      />
+                      <div className="absolute top-4 left-4">
+                        <span
+                          className={`text-[10px] font-black px-2.5 py-1.5 rounded-lg text-white uppercase tracking-[0.1em] shadow-lg ${i === 0 ? "bg-slate-900/80" : "bg-sky-500/90"} backdrop-blur-md`}>
+                          {i === 0 ? "Source Scan" : `Process 0${i}`}
+                        </span>
+                      </div>
+                      <div className="absolute inset-0 ring-1 ring-inset ring-black/5 rounded-2xl"></div>
+                    </div>
+                    <div className="flex flex-col items-center">
+                      <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest group-hover/stage:text-sky-500 transition-colors">
+                        {snap.name}
+                      </span>
+                      <div className="w-8 h-1 bg-slate-100 mt-2 rounded-full group-hover/stage:w-16 group-hover/stage:bg-sky-500 transition-all duration-500"></div>
+                    </div>
+                  </div>
+                ))}
+                {isProcessing &&
+                  Array.from({ length: Math.max(0, 3 - (history.length % 3 || 3)) }).map((_, i) => (
+                    <div key={i} className="flex flex-col gap-4 animate-pulse">
+                      <div className="aspect-[4/5] rounded-2xl border-2 border-dashed border-slate-200 bg-slate-50/50 flex items-center justify-center">
+                        <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Awaiting Neural Step...</span>
+                      </div>
+                      <div className="flex flex-col items-center">
+                        <div className="h-3 w-32 bg-slate-100 rounded-full"></div>
+                        <div className="w-8 h-1 bg-slate-50 mt-2 rounded-full"></div>
+                      </div>
+                    </div>
+                  ))}
               </div>
             )}
-
-            <div className="w-full flex justify-center items-center">
-              <canvas
-                ref={canvasRef}
-                className={`max-w-full h-auto rounded-lg shadow-2xl transition-all duration-700 ${isProcessing ? "scale-95 blur-sm opacity-50" : "scale-100 blur-0 opacity-100"}`}
-              />
-            </div>
           </div>
+        </section>
 
-          <div className="grid grid-cols-8 gap-3">
-            {cells.map((cell, idx) => {
-              // return <img className="bg-white rounded" src={cell} key={idx} />;
-              return <div className="bg-white rounded" dangerouslySetInnerHTML={{ __html: cell.svg }} key={idx} />;
-            })}
-          </div>
-        </main>
-
-        <footer className="flex flex-col items-center gap-6 mt-4">
-          <div className="flex gap-4">
-            <button
-              onClick={processImage}
-              disabled={!cv || isProcessing}
-              className="px-10 py-4 bg-white text-slate-950 hover:bg-slate-100 font-bold rounded-2xl shadow-xl shadow-white/5 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="2"
-                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                />
-              </svg>
-              Refresh Preview
-            </button>
-
-            <button
-              onClick={() => arrayToFont(cells)}
-              disabled={cells.length === 0}
-              className="px-10 py-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-2xl shadow-xl shadow-emerald-500/20 transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2">
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-              </svg>
-              Download Font
-            </button>
-          </div>
-
-          {cells.length > 0 && (
-            <div className="w-full max-w-2xl bg-slate-900/50 border border-slate-800 rounded-xl p-6 flex flex-col gap-4 animate-in fade-in slide-in-from-bottom-2 duration-500">
-              <div className="flex items-center justify-between">
-                <h3 className="text-slate-300 font-medium text-sm">Live Font Preview</h3>
-                <span className="text-[10px] bg-slate-800 text-slate-500 px-2 py-0.5 rounded uppercase font-bold tracking-tighter">HandwrittenFont.ttf</span>
+        {/* ── Section 3: Character Inventory ────────────────────────────── */}
+        {(glyphs.length > 0 || isProcessing) && (
+          <section className="flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <h2 className="text-base font-bold text-slate-900 tracking-tight">Character Inventory</h2>
+                {glyphs.length > 0 && (
+                  <span className="text-[10px] font-semibold text-sky-600 bg-sky-50 border border-sky-100 px-2 py-0.5 rounded-full">
+                    {glyphs.length} glyphs
+                  </span>
+                )}
               </div>
+              {isProcessing && glyphs.length > 0 && (
+                <span className="text-xs text-slate-400 font-medium flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 bg-sky-400 rounded-full animate-ping inline-block"></span>
+                  Extracting…
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 lg:grid-cols-10 xl:grid-cols-12 gap-2" ref={inventoryRef}>
+              {glyphs.map((g, i) => (
+                <div
+                  key={i}
+                  className="group bg-white rounded-xl border border-slate-100 p-2 flex flex-col gap-1.5 shadow-sm hover:shadow-md hover:border-sky-200 hover:-translate-y-px transition-all duration-200 cursor-default">
+                  <div className="aspect-square bg-slate-50 rounded-lg flex items-center justify-center p-2 overflow-hidden group-hover:bg-sky-50/30 transition-colors">
+                    <div
+                      className="w-full h-full flex items-center justify-center grayscale group-hover:grayscale-0 group-hover:scale-110 transition-all duration-300"
+                      dangerouslySetInnerHTML={{ __html: g.svg }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between px-0.5">
+                    <span className="text-[9px] font-bold text-slate-600">{g.type}</span>
+                    <div className="w-3 h-3 rounded overflow-hidden opacity-0 group-hover:opacity-70 transition-opacity flex-shrink-0">
+                      <img src={g.originalImg} className="w-full h-full object-contain" alt="" />
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {isProcessing &&
+                glyphs.length === 0 &&
+                Array.from({ length: 24 }).map((_, i) => <div key={i} className="aspect-square bg-white border border-slate-100 rounded-xl animate-pulse" />)}
+            </div>
+          </section>
+        )}
+
+        {/* ── Section 4: Typography Playground ─────────────────────────── */}
+        {isDone && (
+          <section className="bg-white rounded-2xl border border-sky-100 shadow-xl overflow-hidden flex flex-col">
+            {/* Toolbar */}
+            <div className="px-6 py-3.5 border-b border-slate-50 bg-slate-50/50 flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-3">
+                <h2 className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Typography Playground</h2>
+                <span className="inline-flex items-center gap-1 text-[9px] font-semibold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded-full">
+                  <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
+                  </svg>
+                  Font Active
+                </span>
+              </div>
+              <button
+                onClick={downloadTTF}
+                className="flex items-center gap-1.5 px-4 py-2 bg-slate-900 text-white text-xs font-semibold rounded-lg hover:bg-sky-600 active:scale-95 transition-all">
+                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+                Export .TTF
+              </button>
+            </div>
+
+            {/* Canvas area with dot grid */}
+            <div
+              className="relative flex-1 min-h-[340px] flex items-center justify-center p-10"
+              style={{ backgroundImage: "radial-gradient(circle, #cbd5e1 1px, transparent 1px)", backgroundSize: "22px 22px" }}>
               <textarea
-                id="font-preview-text"
-                placeholder="Type here to test your font..."
+                id="font-preview"
                 defaultValue="The quick brown fox jumps over the lazy dog."
-                className="w-full bg-transparent border-none text-4xl text-white resize-none focus:outline-none placeholder:text-slate-700 min-h-[100px]"
-                style={{ fontFamily: "inherit" }}
+                style={{ fontFamily: appliedFontName, fontSize: 100, lineHeight: 1.2 }}
+                className="relative z-10 w-full text-center bg-transparent uppercase border-none focus:outline-none resize-none no-scrollbar text-slate-900 placeholder:text-slate-200"
+                spellCheck={false}
+                rows={3}
               />
             </div>
-          )}
 
-          <div className="flex items-center gap-8 text-slate-500 text-sm">
-            <span className="flex items-center gap-2">
-              <span className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></span>
-              OpenCV WASM Ready
-            </span>
-            <span className="flex items-center gap-2">
-              <span className="w-2 h-2 bg-blue-500 rounded-full"></span>
-              GPU Accelerated
-            </span>
-          </div>
-        </footer>
-      </div>
+            {/* Metadata strip */}
+            <div className="px-6 py-3 border-t border-slate-50 bg-slate-50/40 flex items-center gap-5 flex-wrap">
+              <span className="text-[10px] text-slate-400">
+                <span className="font-semibold text-slate-600">{glyphs.length}</span> glyphs
+              </span>
+              <span className="text-[10px] text-slate-400">
+                <span className="font-semibold text-slate-600">1000</span> units/EM
+              </span>
+              <span className="text-[10px] font-mono text-sky-500 truncate max-w-[240px]">{appliedFontName}</span>
+            </div>
+          </section>
+        )}
+
+        <div className="h-8"></div>
+      </main>
+
+      <canvas ref={canvasRef} className="hidden" />
     </div>
   );
 }
