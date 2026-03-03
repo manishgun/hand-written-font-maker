@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "homepage": "https://manishgun.github.io/hand-written-font-maker",
+  "homepage": "https://font.crudios.com",
   "scripts": {
     "predeploy": "npm run build",
     "deploy": "gh-pages -d dist",
