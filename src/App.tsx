@@ -5,73 +5,9 @@ import opentype from "opentype.js";
 import { DOMParser } from "xmldom";
 import svgpath from "svgpath";
 import confetti from "canvas-confetti";
+import { characters } from "./constants";
 
-const TYPE_SEQUENCE = [
-  "!",
-  '"',
-  "%",
-  "&",
-  "'",
-  "(",
-  undefined,
-  undefined,
-  ")",
-  "+",
-  ",",
-  "-",
-  ".",
-  "/",
-  undefined,
-  undefined,
-  ":",
-  ";",
-  "=",
-  "?",
-  "@",
-  "A",
-  "B",
-  "C",
-  "D",
-  "E",
-  "F",
-  "G",
-  "H",
-  "I",
-  "J",
-  "K",
-  "L",
-  "M",
-  "N",
-  "O",
-  "P",
-  "Q",
-  "R",
-  "S",
-  "T",
-  "U",
-  "V",
-  "W",
-  "X",
-  "Y",
-  "Z",
-  "a",
-  "b",
-  "c",
-  "d",
-  "e",
-  "f",
-  "g",
-  "h",
-  "i",
-  "j",
-  "k",
-  "l",
-  "m",
-  "n",
-  "o",
-  "p",
-  "q",
-];
+const TYPE_SEQUENCE = characters;
 
 type Step = "idle" | "grayscale" | "denoise" | "contrast" | "threshold" | "edges" | "corners" | "warped" | "blocks" | "extracting" | "done";
 
@@ -342,13 +278,16 @@ function App() {
     const blurred = new cv.Mat();
     cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
     await snap("denoise", blurred, "Antialiasing");
-    blurred.delete();
+
+    const hdr = new cv.Mat();
+
+    const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+    clahe.apply(blurred, hdr);
 
     // Visual Stage: Contrast
     const contrast = new cv.Mat();
-    gray.convertTo(contrast, -1, 1.4, 0);
+    hdr.convertTo(contrast, -1, 1.8, 1.4);
     await snap("contrast", contrast, "Luma Correction");
-    contrast.delete();
 
     const thresh = new cv.Mat();
     cv.threshold(gray, thresh, 120, 255, cv.THRESH_BINARY_INV);
@@ -358,8 +297,8 @@ function App() {
     cv.Canny(gray, edges, 50, 150);
     await snap("edges", edges, "Edge Topology");
 
-    const contours = new cv.MatVector(),
-      hier = new cv.Mat();
+    const contours = new cv.MatVector();
+    const hier = new cv.Mat();
     cv.findContours(edges, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
     const rects: opencv.Rect[] = [];
     for (let i = 0; i < contours.size(); i++) {
@@ -368,13 +307,13 @@ function App() {
       cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
       if (approx.rows === 4 && cv.isContourConvex(approx)) {
         const r = cv.boundingRect(cnt);
-        if (r.width > 20 && r.width < 140) rects.push(r);
+        if (r.width > 20 && r.width < 140 && r.height > 20 && r.height < 150) rects.push(r);
       }
       approx.delete();
     }
 
     // Visual Stage: Anchor Detection (Drawn on Canvas via decorator to keep 'src' pure)
-    await snap("corners", src, "Geometric Anchors", 700, (ctx, c) => {
+    await snap("corners", contrast, "Geometric Anchors", 700, (ctx, c) => {
       const scaleX = c.width / src.cols;
       const scaleY = c.height / src.rows;
       ctx.strokeStyle = "#0ea5e9";
@@ -396,7 +335,7 @@ function App() {
           { x: (bl.x + bl.width / 2) * scaleX, y: (bl.y + bl.height / 2) * scaleY },
         ];
         ctx.beginPath();
-        ctx.lineWidth = 5;
+        ctx.lineWidth = 10;
         ctx.globalAlpha = 0.8;
         ctx.moveTo(pts[0].x, pts[0].y);
         for (let i = 1; i <= 4; i++) {
@@ -409,16 +348,21 @@ function App() {
 
     // REAL PROCESSING: Create the final clean warped mat
     let warped = src.clone();
+
+    // console.log(rects);
+
+    // if (rects.length !== 4) return;
+
     if (rects.length === 4) {
       const tl = rects.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
       const tr = rects.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
       const br = rects.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
       const bl = rects.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
       const s = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y + tl.height, tr.x + tr.width, tr.y + tr.height, br.x + br.width, br.y, bl.x, bl.y]);
-      const d = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, 800, 0, 800, 1000, 0, 1000]);
+      const d = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, 2400, 0, 2400, 3000, 0, 3000]);
       const M = cv.getPerspectiveTransform(s, d);
       warped = new cv.Mat();
-      cv.warpPerspective(src, warped, M, new cv.Size(800, 1000));
+      cv.warpPerspective(contrast, warped, M, new cv.Size(2400, 3000));
       M.delete();
       s.delete();
       d.delete();
@@ -427,12 +371,12 @@ function App() {
 
     // Visual Stage: Grid Mapping / Text Block Analysis (Drawn on Canvas via decorator)
     await snap("blocks", warped, "Segment Mapping", 800, (ctx, c) => {
-      const stepW = c.width / 8;
-      const stepH = c.height / 8;
+      const stepW = c.width / 9;
+      const stepH = c.height / 11;
       ctx.strokeStyle = "#0ea5e9";
       ctx.lineWidth = 2;
       ctx.globalAlpha = 0.6;
-      for (let i = 1; i < 8; i++) {
+      for (let i = 1; i < 11; i++) {
         ctx.beginPath();
         ctx.moveTo(i * stepW, 0);
         ctx.lineTo(i * stepW, c.height);
@@ -446,7 +390,7 @@ function App() {
     });
 
     setCurrentStep("extracting");
-    const DIM = { rows: 8, cols: 8, rGap: 40, cGap: 14 };
+    const DIM = { rows: 11, cols: 9, rGap: 100, cGap: 32 };
     const w = (warped.cols - (DIM.cols + 1) * DIM.cGap) / DIM.cols;
     const h = (warped.rows - (DIM.rows + 1) * DIM.rGap) / DIM.rows;
     let idx = 0;
@@ -463,7 +407,7 @@ function App() {
           cc.height = Math.round(h * 2.5);
 
           // Extract directly from the warped Mat to avoid visual artifacts from the display canvas
-          const roi = warped.roi(new cv.Rect(x, y + 2, w - 2, h - 2));
+          const roi = warped.roi(new cv.Rect(x + 4, y + 16, w - 4, h - 4));
           const tmpMat = new cv.Mat();
           cv.resize(roi, tmpMat, new cv.Size(cc.width, cc.height), 0, 0, cv.INTER_LANCZOS4);
           cv.imshow(cc, tmpMat);
@@ -471,7 +415,7 @@ function App() {
           tmpMat.delete();
 
           const originalImg = cc.toDataURL("image/png");
-          const svg = await new Promise<string>((res) => Potrace.trace(originalImg, (_, r) => res(r || "")));
+          const svg = await new Promise<string>((res) => Potrace.trace(originalImg, { turdSize: 160 }, (_, r) => res(r || "")));
           if (svg) {
             const g = { type, svg, originalImg };
             extracted.push(g);
@@ -490,6 +434,8 @@ function App() {
     contours.delete();
     hier.delete();
     warped.delete();
+    blurred.delete();
+    contrast.delete();
     src.delete();
     setTimeout(() => {
       applyGeneratedFont(extracted);
@@ -658,11 +604,38 @@ function App() {
             <div className="flex flex-col gap-4">
               <h1 className="text-[52px] font-black tracking-tight text-slate-900 leading-[1.05]">
                 Your Handwriting <br />
-                <span className="text-transparent bg-clip-text bg-gradient-to-r from-sky-500 to-indigo-600">→ Perfect Typeface</span>
+                <span className="text-transparent bg-clip-text bg-linear-to-r from-sky-500 to-indigo-600">→ Perfect Typeface</span>
               </h1>
               <p className="text-lg text-slate-500 leading-relaxed max-w-lg">
                 Upload a scanned character grid and watch our pipeline vectorize your handwriting into a professional .TTF font in real-time.
               </p>
+
+              <div className="flex flex-wrap gap-3 mt-2">
+                <a
+                  href={`${import.meta.env.BASE_URL}FONT-TEMPLATE.pdf`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-5 py-2.5 bg-sky-500 text-white text-xs font-bold rounded-xl shadow-lg shadow-sky-500/20 hover:bg-sky-600 transition-all flex items-center gap-2">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="2.5"
+                      d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                    />
+                  </svg>
+                  Get Blank Template
+                </a>
+                <a
+                  href={`${import.meta.env.BASE_URL}demo-template.jpg`}
+                  download
+                  className="px-5 py-2.5 bg-white border border-slate-200 text-slate-600 text-xs font-bold rounded-xl shadow-sm hover:border-sky-200 hover:text-sky-500 transition-all flex items-center gap-2">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                  </svg>
+                  Demo Scan
+                </a>
+              </div>
             </div>
 
             <div className="flex flex-col gap-5">
@@ -832,12 +805,12 @@ function App() {
                   <div key={i} className="flex flex-col gap-4 group/stage cursor-default animate-fade-in-up" style={{ animationDelay: `${i * 100}ms` }}>
                     <div className="relative overflow-hidden rounded-2xl border border-slate-100 bg-slate-100 shadow-sm group-hover/stage:border-sky-200 group-hover/stage:shadow-xl group-hover/stage:-translate-y-1 transition-all duration-500">
                       <img src={snap.image} className="w-full aspect-[4/5] object-cover transition-all duration-700" alt={snap.name} />
-                      <div className="absolute top-4 left-4">
+                      {/* <div className="absolute top-4 left-4">
                         <span
                           className={`text-[10px] font-black px-2.5 py-1.5 rounded-lg text-white uppercase tracking-[0.1em] shadow-lg ${i === 0 ? "bg-slate-900/80" : "bg-sky-500/90"} backdrop-blur-md`}>
                           {i === 0 ? "Source Scan" : `Process ${i < 10 ? "0" : ""}${i}`}
                         </span>
-                      </div>
+                      </div> */}
                       <div className="absolute inset-0 ring-1 ring-inset ring-black/5 rounded-2xl"></div>
                     </div>
                     <div className="flex flex-col items-center">
@@ -943,7 +916,7 @@ function App() {
                 id="font-preview"
                 defaultValue="The quick brown fox jumps over the lazy dog."
                 style={{ fontFamily: appliedFontName, fontSize: 100, lineHeight: 1.2 }}
-                className="relative z-10 w-full text-center bg-transparent uppercase border-none focus:outline-none resize-none no-scrollbar text-slate-900 placeholder:text-slate-200"
+                className="relative z-10 w-full text-center bg-transparent border-none focus:outline-none resize-none no-scrollbar text-slate-900 placeholder:text-slate-200"
                 spellCheck={false}
                 rows={3}
               />
