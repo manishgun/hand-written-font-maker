@@ -4,6 +4,7 @@ import Potrace from "potrace";
 import opentype from "opentype.js";
 import { DOMParser } from "xmldom";
 import svgpath from "svgpath";
+import confetti from "canvas-confetti";
 
 const TYPE_SEQUENCE = [
   "!",
@@ -568,11 +569,39 @@ function App() {
   const applyGeneratedFont = async (gs: Glyph[]) => {
     const buf = getFontBuffer(gs);
     if (!buf) return;
+
+    // Start audio early to compensate for latency
+    const audio = new Audio("/confetti-gun.mp3");
+    audio.play().catch(() => {});
+
     const name = `UF_${Math.random().toString(36).substr(2, 8)}`;
     try {
       const f = await new FontFace(name, buf).load();
       document.fonts.add(f);
       setAppliedFontName(name);
+
+      // ── Success Celebration: Sequential Blasts ───────────────────────
+      const colors = ["#0ea5e9", "#6366f1", "#8b5cf6"];
+
+      // 1. Right Blast
+      confetti({
+        particleCount: 80,
+        angle: 120,
+        spread: 70,
+        origin: { x: 1, y: 0.6 },
+        colors: colors,
+      });
+
+      // 2. Left Blast after 300ms
+      setTimeout(() => {
+        confetti({
+          particleCount: 80,
+          angle: 60,
+          spread: 70,
+          origin: { x: 0, y: 0.6 },
+          colors: colors,
+        });
+      }, 300);
     } catch (e) {
       console.error(e);
     }
@@ -618,23 +647,67 @@ function App() {
       </header>
 
       <main className="max-w-[1280px] mx-auto w-full px-6 py-12 flex flex-col gap-12">
-        {/* ── Section 1: Upload ──────────────────────────────────────────── */}
-        <section className="flex flex-col items-center gap-8">
-          <div className="text-center max-w-lg">
-            <h1 className="text-[28px] font-bold tracking-tight text-slate-900 leading-tight">Handwriting → Font File</h1>
-            <p className="mt-2 text-sm text-slate-500 leading-relaxed">
-              Upload an 8×8 character-grid scan. The pipeline extracts each glyph, vectorises it, fixes winding order, and compiles a valid .TTF.
-            </p>
+        {/* ── Section 1: Hero Section ──────────────────────────────────────────── */}
+        <section className="grid lg:grid-cols-2 gap-16 items-center py-8">
+          {/* Left Side: Hero Content */}
+          <div className="flex flex-col gap-8">
+            <div className="inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full bg-sky-50 border border-sky-100 text-sky-600 text-[11px] font-bold uppercase tracking-wider w-fit">
+              <span className="w-2 h-2 rounded-full bg-sky-500 animate-pulse"></span>
+              Neural Extraction Engine v2.0
+            </div>
+
+            <div className="flex flex-col gap-4">
+              <h1 className="text-[52px] font-black tracking-tight text-slate-900 leading-[1.05]">
+                Your Handwriting <br />
+                <span className="text-transparent bg-clip-text bg-gradient-to-r from-sky-500 to-indigo-600">→ Perfect Typeface</span>
+              </h1>
+              <p className="text-lg text-slate-500 leading-relaxed max-w-lg">
+                Upload a scanned character grid and watch our pipeline vectorize your handwriting into a professional .TTF font in real-time.
+              </p>
+            </div>
+
+            <div className="flex flex-col gap-5">
+              <div className="flex items-center gap-4 text-sm font-medium text-slate-600">
+                <div className="w-10 h-10 rounded-xl bg-white border border-slate-100 shadow-sm flex items-center justify-center text-sky-500">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-slate-900 font-bold">O(1) Processing</p>
+                  <p className="text-slate-400 text-xs text-nowrap">Instant vectorization & manifold correction</p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-4 text-sm font-medium text-slate-600">
+                <div className="w-10 h-10 rounded-xl bg-white border border-slate-100 shadow-sm flex items-center justify-center text-indigo-500">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="2.5"
+                      d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"
+                    />
+                  </svg>
+                </div>
+                <div>
+                  <p className="text-slate-900 font-bold">Winding Consistency</p>
+                  <p className="text-slate-400 text-xs text-nowrap">Auto-corrects path orientation for TTF compliance</p>
+                </div>
+              </div>
+            </div>
           </div>
 
-          <div className="w-full max-w-xl">
-            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+          {/* Right Side: Upload Interface */}
+          <div className="w-full relative">
+            <div className="absolute -inset-4 bg-gradient-to-tr from-sky-100/50 to-indigo-100/50 blur-3xl opacity-50 -z-10 rounded-[40px]"></div>
+            <div className="bg-white border border-slate-200 rounded-3xl shadow-xl shadow-slate-200/50 overflow-hidden">
               {/* Drop-zone */}
-              <div className="relative aspect-video bg-slate-50 group">
+              <div className="relative aspect-[4/3] bg-slate-50 group">
                 {!imageFile ? (
                   <label className="absolute inset-0 flex flex-col items-center justify-center cursor-pointer hover:bg-sky-50/40 transition-colors duration-300">
-                    <div className="w-12 h-12 rounded-2xl bg-white border border-slate-200 flex items-center justify-center mb-3 shadow-sm group-hover:border-sky-300 group-hover:shadow-sky-100 group-hover:scale-105 transition-all duration-300">
-                      <svg className="w-5 h-5 text-slate-400 group-hover:text-sky-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <div className="w-16 h-16 rounded-2xl bg-white border border-slate-200 flex items-center justify-center mb-4 shadow-sm group-hover:border-sky-300 group-hover:shadow-sky-100 group-hover:scale-105 transition-all duration-300">
+                      <svg className="w-7 h-7 text-slate-400 group-hover:text-sky-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path
                           strokeLinecap="round"
                           strokeLinejoin="round"
@@ -643,39 +716,39 @@ function App() {
                         />
                       </svg>
                     </div>
-                    <p className="text-sm font-medium text-slate-500">
-                      Drop scan or <span className="text-sky-500 font-semibold">browse</span>
+                    <p className="text-base font-bold text-slate-700">
+                      Drop scan or <span className="text-sky-500 underline decoration-2 underline-offset-4">browse</span>
                     </p>
-                    <p className="text-xs text-slate-400 mt-1">PNG / JPG · 8×8 character grid</p>
+                    <p className="text-xs text-slate-400 mt-2">PNG / JPG · 8×8 character grid</p>
                     <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                   </label>
                 ) : (
                   <>
-                    <img src={processedImage!} className="w-full h-full object-contain" alt="scan" />
+                    <img src={processedImage!} className="w-full h-full object-contain p-4" alt="scan" />
 
                     {/* Scanning overlay */}
                     {isProcessing && (
                       <div className="absolute inset-0 bg-white/60 backdrop-blur-[1px] flex items-center justify-center">
-                        <div className="absolute top-0 left-0 w-full h-[2px] bg-sky-500 shadow-[0_0_14px_rgba(14,165,233,0.9)] animate-scan z-10"></div>
-                        <div className="bg-white/95 px-5 py-2.5 rounded-full shadow-lg border border-slate-100 flex items-center gap-2.5">
-                          <div className="w-3 h-3 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
-                          <span className="text-xs font-semibold text-slate-700 capitalize">{currentStep}…</span>
+                        <div className="absolute top-0 left-0 w-full h-[3px] bg-sky-500 shadow-[0_0_20px_rgba(14,165,233,1)] animate-scan z-10"></div>
+                        <div className="bg-white/95 px-6 py-3 rounded-2xl shadow-2xl border border-slate-100 flex items-center gap-3 scale-110">
+                          <div className="w-4 h-4 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
+                          <span className="text-xs font-bold text-slate-800 uppercase tracking-widest">{currentStep}…</span>
                         </div>
                       </div>
                     )}
 
                     {/* Hover overlay when idle or done */}
                     {!isProcessing && (
-                      <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end justify-center pb-4 gap-2.5">
-                        <label className="px-4 py-2 bg-white/90 backdrop-blur text-slate-700 text-xs font-semibold rounded-full cursor-pointer hover:bg-white transition active:scale-95 shadow-sm">
-                          Change
+                      <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end justify-center pb-8 gap-3">
+                        <label className="px-6 py-2.5 bg-white/95 backdrop-blur text-slate-900 text-xs font-bold rounded-xl cursor-pointer hover:bg-white transition active:scale-95 shadow-lg">
+                          Change Image
                           <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                         </label>
                         {isIdle && (
                           <button
                             onClick={processImage}
-                            className="px-5 py-2 bg-sky-500 text-white text-xs font-semibold rounded-full shadow-lg hover:bg-sky-600 active:scale-95 transition">
-                            Run Analysis
+                            className="px-8 py-2.5 bg-sky-500 text-white text-xs font-bold rounded-xl shadow-xl hover:bg-sky-600 active:scale-95 transition">
+                            Run Full Pipeline
                           </button>
                         )}
                       </div>
@@ -685,44 +758,44 @@ function App() {
               </div>
 
               {/* Bottom action bar */}
-              <div className="px-5 py-4 border-t border-slate-100 flex gap-2.5">
+              <div className="px-6 py-5 border-t border-slate-100 flex gap-3 bg-slate-50/40">
                 {!imageFile ? (
-                  <label className="flex-1 py-2.5 rounded-xl border border-dashed border-slate-200 text-slate-400 text-sm font-medium flex items-center justify-center gap-2 cursor-pointer hover:border-sky-300 hover:text-sky-500 hover:bg-sky-50/50 transition-all">
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4" />
+                  <label className="flex-1 py-3.5 rounded-2xl border-2 border-dashed border-slate-200 text-slate-400 text-sm font-bold flex items-center justify-center gap-2.5 cursor-pointer hover:border-sky-300 hover:text-sky-500 hover:bg-white transition-all">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
                     </svg>
-                    Select scan
+                    Select Template Scan
                     <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                   </label>
                 ) : isIdle ? (
                   <button
                     onClick={processImage}
                     disabled={!cv}
-                    className="flex-1 py-2.5 rounded-xl bg-sky-500 text-white text-sm font-semibold flex items-center justify-center gap-2 hover:bg-sky-600 active:scale-[0.98] disabled:opacity-40 transition-all shadow-md shadow-sky-500/20">
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    className="flex-1 py-3.5 rounded-2xl bg-sky-500 text-white text-sm font-bold flex items-center justify-center gap-2.5 hover:bg-sky-600 active:scale-[0.98] disabled:opacity-40 transition-all shadow-lg shadow-sky-500/25">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
                     </svg>
-                    Run Analysis
+                    Initialize Neural Logic
                   </button>
                 ) : isDone ? (
                   <button
                     onClick={downloadTTF}
-                    className="flex-1 py-2.5 rounded-xl bg-slate-900 text-white text-sm font-semibold flex items-center justify-center gap-2 hover:bg-sky-600 active:scale-[0.98] transition-all shadow-md">
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    className="flex-1 py-3.5 rounded-2xl bg-slate-900 text-white text-sm font-bold flex items-center justify-center gap-2.5 hover:bg-sky-600 active:scale-[0.98] transition-all shadow-xl">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                     </svg>
-                    Download .TTF
+                    Export Custom .TTF
                   </button>
                 ) : (
-                  <div className="flex-1 py-2.5 rounded-xl bg-slate-50 border border-slate-100 flex items-center justify-center gap-2 text-sm text-slate-400">
-                    <div className="w-3.5 h-3.5 border-2 border-sky-400 border-t-transparent rounded-full animate-spin"></div>
-                    <span className="capitalize font-medium">{currentStep}…</span>
+                  <div className="flex-1 py-3.5 rounded-2xl bg-white border border-slate-200 flex items-center justify-center gap-3 text-sm text-slate-500 shadow-sm">
+                    <div className="w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin"></div>
+                    <span className="capitalize font-bold tracking-wide">{currentStep}…</span>
                   </div>
                 )}
                 {imageFile && (
                   <button
                     onClick={reset}
-                    className="px-4 py-2.5 rounded-xl border border-slate-200 text-slate-400 text-sm font-medium hover:border-rose-200 hover:text-rose-400 hover:bg-rose-50 active:scale-[0.98] transition-all">
+                    className="px-6 py-3.5 rounded-2xl border border-slate-200 text-slate-400 text-sm font-bold hover:border-rose-200 hover:text-rose-500 hover:bg-rose-50 active:scale-[0.98] transition-all">
                     Reset
                   </button>
                 )}
