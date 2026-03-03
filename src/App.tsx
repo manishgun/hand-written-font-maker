@@ -637,8 +637,7 @@ function App() {
               />
             </svg>
           </div>
-          <span className="font-bold text-slate-900 text-[15px] tracking-tight">FontForge</span>
-          <span className="text-[9px] font-semibold uppercase tracking-wider text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">Studio</span>
+          <span className="font-bold text-slate-900 text-[15px] tracking-tight whitespace-nowrap">Hand Writing Font</span>
         </div>
         <div className={`flex items-center gap-1.5 text-xs font-medium ${cv ? "text-emerald-600" : "text-amber-500"}`}>
           <span className={`w-1.5 h-1.5 rounded-full ${cv ? "bg-emerald-500" : "bg-amber-400 animate-pulse"}`}></span>
@@ -965,6 +964,16 @@ function App() {
 
         <div className="h-8"></div>
       </main>
+
+      <footer className="w-full py-8 border-t border-slate-100 flex flex-col items-center gap-2">
+        <p className="text-xs text-slate-400 font-medium">
+          Made with Love by{" "}
+          <a href="https://www.linkedin.com/in/manish-gun/" target="_blank" rel="noopener noreferrer" className="text-sky-500 font-bold hover:underline">
+            Manish Gun
+          </a>
+        </p>
+        <p className="text-[10px] text-slate-300">© 2025 All Rights Reserved</p>
+      </footer>
 
       <canvas ref={canvasRef} className="hidden" />
     </div>

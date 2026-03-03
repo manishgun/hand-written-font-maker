@@ -1,40 +1,42 @@
-# FontForge Studio 🖋️
+# Hand Writing Font 🖋️
 
-**FontForge Studio** is a high-performance, browser-based neural extraction engine that converts your handwritten character scans into professional, vector-based `.TTF` font files in real-time.
+![Hand Writing Font Thumbnail](https://via.placeholder.com/1280x640?text=Hand+Writing+Font+Preview)
 
-[**Live Demo: font.crudios.com**](https://font.crudios.com)
+**Hand Writing Font** is a high-performance, browser-based neural extraction engine that converts your handwritten character scans into professional, vector-based `.TTF` font files in real-time.
+
+[**✨ Try the Live Demo: font.crudios.com**](https://font.crudios.com)
 
 ---
 
 ## 🚀 Key Features
 
-- **Neural Processing Pipeline**: Built with OpenCV.js for high-fidelity image analysis.
-- **Auto-Perspective Correction**: Uses 4-corner anchor detection to de-warp and normalize document scans.
-- **Advanced Vectorization**: Integrates Potrace for converting raster strokes into smooth, scalable SVG paths.
-- **TTF Compliance Engine**:
+- **🧠 Neural Processing Pipeline**: Built with OpenCV.js for high-fidelity image analysis.
+- **📐 Auto-Perspective Correction**: Uses 4-corner anchor detection to de-warp and normalize document scans.
+- **⚡ Advanced Vectorization**: Integrates Potrace for converting raster strokes into smooth, scalable SVG paths.
+- **🛠️ TTF Compliance Engine**:
   - Auto-corrects winding order (Shoelace area algorithm).
   - Preserves native Bezier curves for professional edge smoothness.
   - Manages complex hole sub-paths for characters like 'O', 'B', and 'P'.
-- **Interactive Typography Playground**: Test your generated font instantly with a real-time textarea preview.
-- **Character Inventory**: Review every extracted glyph before exporting.
-- **Celebratory Export**: Smooth .TTF compilation with a celebratory confetti blast 🎊.
+- **🎭 Interactive Typography Playground**: Test your generated font instantly with a real-time preview.
+- **📦 Character Inventory**: Review every extracted glyph before exporting.
+- **🎉 Celebratory Export**: Smooth .TTF compilation with a celebratory confetti blast 🎊.
 
 ---
 
-## 🛠️ The Pipeline
+## 🛠️ The Vision Pipeline
 
-FontForge Studio runs a sophisticated 10-stage vision pipeline:
+The engine runs a sophisticated **10-stage vision pipeline** to ensure perfect extraction:
 
-1. **Grayscale**: Color removal for pure luminance analysis.
-2. **Antialiasing**: Gaussian-based noise reduction for smoother edges.
-3. **Luma Correction**: Dynamic contrast boosting to isolate strokes from paper background.
-4. **Thresholding**: Intelligent binarization of the image.
-5. **Edge Topology**: Canny edge detection to identify stroke boundaries.
-6. **Geometric Anchors**: Locates the four calibration blocks on your template.
-7. **Perspective Correction**: Warps the image into a perfect 800x1000 orthographic grid.
-8. **Segment Mapping**: Overlays an 8×8 grid to align character extraction.
-9. **Neural Extraction**: Isolates individual glyph pixels in parallel.
-10. **Vectorization (Potrace)**: Converts extracts to SVG paths and compiles the final Font Buffer.
+1. **🌑 Grayscale**: Color removal for pure luminance analysis.
+2. **🌪️ Antialiasing**: Gaussian-based noise reduction for smoother edges.
+3. **🌓 Luma Correction**: Dynamic contrast boosting to isolate strokes from background.
+4. **🏁 Thresholding**: Intelligent binarization of the image.
+5. **🕸️ Edge Topology**: Canny edge detection to identify stroke boundaries.
+6. **📍 Geometric Anchors**: Locates the four calibration blocks on your template.
+7. **🖼️ Perspective Correction**: Warps the image into a perfect 800x1000 grid.
+8. **🗺️ Segment Mapping**: Overlays an 8×8 grid to align character extraction.
+9. **✂️ Neural Extraction**: Isolates individual glyph pixels in parallel.
+10. **💎 Vectorization**: Converts extracts to SVG paths and compiles the final TTF.
 
 ---
 
@@ -94,4 +96,4 @@ This project is open-source and available under the MIT License.
 
 ---
 
-Made with ❤️ by [Manish](https://github.com/manishgun)
+Made with ❤️ by [Manish Gun](https://www.linkedin.com/in/manish-gun/)
