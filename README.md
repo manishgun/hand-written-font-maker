@@ -1,73 +1,97 @@
-# React + TypeScript + Vite
+# FontForge Studio 🖋️
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+**FontForge Studio** is a high-performance, browser-based neural extraction engine that converts your handwritten character scans into professional, vector-based `.TTF` font files in real-time.
 
-Currently, two official plugins are available:
+[**Live Demo: font.crudios.com**](https://font.crudios.com)
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+---
 
-## React Compiler
+## 🚀 Key Features
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **Neural Processing Pipeline**: Built with OpenCV.js for high-fidelity image analysis.
+- **Auto-Perspective Correction**: Uses 4-corner anchor detection to de-warp and normalize document scans.
+- **Advanced Vectorization**: Integrates Potrace for converting raster strokes into smooth, scalable SVG paths.
+- **TTF Compliance Engine**:
+  - Auto-corrects winding order (Shoelace area algorithm).
+  - Preserves native Bezier curves for professional edge smoothness.
+  - Manages complex hole sub-paths for characters like 'O', 'B', and 'P'.
+- **Interactive Typography Playground**: Test your generated font instantly with a real-time textarea preview.
+- **Character Inventory**: Review every extracted glyph before exporting.
+- **Celebratory Export**: Smooth .TTF compilation with a celebratory confetti blast 🎊.
 
-## Expanding the ESLint configuration
+---
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## 🛠️ The Pipeline
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+FontForge Studio runs a sophisticated 10-stage vision pipeline:
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+1. **Grayscale**: Color removal for pure luminance analysis.
+2. **Antialiasing**: Gaussian-based noise reduction for smoother edges.
+3. **Luma Correction**: Dynamic contrast boosting to isolate strokes from paper background.
+4. **Thresholding**: Intelligent binarization of the image.
+5. **Edge Topology**: Canny edge detection to identify stroke boundaries.
+6. **Geometric Anchors**: Locates the four calibration blocks on your template.
+7. **Perspective Correction**: Warps the image into a perfect 800x1000 orthographic grid.
+8. **Segment Mapping**: Overlays an 8×8 grid to align character extraction.
+9. **Neural Extraction**: Isolates individual glyph pixels in parallel.
+10. **Vectorization (Potrace)**: Converts extracts to SVG paths and compiles the final Font Buffer.
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+---
+
+## 📝 Character Template
+
+The engine expects a standard **8×8 Character Grid**. Follow the sequence below to ensure your font maps correctly:
+
+| Row   | Col 1 | Col 2 | Col 3 | Col 4 | Col 5 | Col 6 | Col 7 | Col 8 |
+| :---- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **0** |  `!`  |  `"`  |  `%`  |  `&`  |  `'`  |  `(`  |   -   |   -   |
+| **1** |  `)`  |  `+`  |  `,`  |  `-`  |  `.`  |  `/`  |   -   |   -   |
+| **2** |  `:`  |  `;`  |  `=`  |  `?`  |  `@`  |  `A`  |  `B`  |  `C`  |
+| **3** |  `D`  |  `E`  |  `F`  |  `G`  |  `H`  |  `I`  |  `J`  |  `K`  |
+| **4** |  `L`  |  `M`  |  `N`  |  `O`  |  `P`  |  `Q`  |  `R`  |  `S`  |
+| **5** |  `T`  |  `U`  |  `V`  |  `W`  |  `X`  |  `Y`  |  `Z`  |  `a`  |
+| **6** |  `b`  |  `c`  |  `d`  |  `e`  |  `f`  |  `g`  |  `h`  |  `i`  |
+| **7** |  `j`  |  `k`  |  `l`  |  `m`  |  `n`  |  `o`  |  `p`  |  `q`  |
+
+---
+
+## 💻 Technical Stack
+
+- **Framework**: React 19 + TypeScript
+- **Styling**: Tailwind CSS 4.0
+- **Computer Vision**: OpenCV.js
+- **Typography Engine**: opentype.js
+- **Vectorization**: Potrace
+- **Path Manipulation**: svgpath
+
+---
+
+## 🔨 Development
+
+### Install Dependencies
+
+```bash
+npm install
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+### Run Locally
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run dev
 ```
+
+### Build for Production
+
+```bash
+npm run build
+```
+
+---
+
+## 📄 License
+
+This project is open-source and available under the MIT License.
+
+---
+
+Made with ❤️ by [Manish](https://github.com/manishgun)
