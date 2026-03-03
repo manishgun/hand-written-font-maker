@@ -323,9 +323,10 @@ function App() {
     canvas.getContext("2d")!.drawImage(img, 0, 0);
     const src = cv.imread(canvas);
 
-    const snap = async (step: Step, mat: any, name: string, delay = 700) => {
+    const snap = async (step: Step, mat: any, name: string, delay = 700, decorate?: (ctx: CanvasRenderingContext2D, c: HTMLCanvasElement) => void) => {
       setCurrentStep(step);
       cv.imshow(canvas, mat);
+      if (decorate) decorate(canvas.getContext("2d")!, canvas);
       const url = canvas.toDataURL();
       setProcessedImage(url);
       setHistory((p) => [...p, { name, image: url }]);
@@ -371,31 +372,39 @@ function App() {
       approx.delete();
     }
 
-    // Visual Stage: Anchor Detection (Boundary on those 4 blocks)
-    const anchorMat = src.clone();
-    rects.forEach((r) => {
-      const p1 = new cv.Point(r.x, r.y);
-      const p2 = new cv.Point(r.x + r.width, r.y + r.height);
-      cv.rectangle(anchorMat, p1, p2, [14, 165, 233, 255], 8);
-    });
-    // Draw lines between detected corners to show boundary
-    if (rects.length === 4) {
-      const tl = rects.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
-      const tr = rects.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
-      const br = rects.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
-      const bl = rects.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
-      const pts = [
-        new cv.Point(tl.x + tl.width / 2, tl.y + tl.height / 2),
-        new cv.Point(tr.x + tr.width / 2, tr.y + tr.height / 2),
-        new cv.Point(br.x + br.width / 2, br.y + br.height / 2),
-        new cv.Point(bl.x + bl.width / 2, bl.y + bl.height / 2),
-      ];
-      for (let i = 0; i < 4; i++) {
-        cv.line(anchorMat, pts[i], pts[(i + 1) % 4], [14, 165, 233, 200], 5);
+    // Visual Stage: Anchor Detection (Drawn on Canvas via decorator to keep 'src' pure)
+    await snap("corners", src, "Geometric Anchors", 700, (ctx, c) => {
+      const scaleX = c.width / src.cols;
+      const scaleY = c.height / src.rows;
+      ctx.strokeStyle = "#0ea5e9";
+      ctx.lineWidth = 8;
+
+      rects.forEach((r) => {
+        ctx.strokeRect(r.x * scaleX, r.y * scaleY, r.width * scaleX, r.height * scaleY);
+      });
+
+      if (rects.length === 4) {
+        const tl = rects.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
+        const tr = rects.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
+        const br = rects.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
+        const bl = rects.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
+        const pts = [
+          { x: (tl.x + tl.width / 2) * scaleX, y: (tl.y + tl.height / 2) * scaleY },
+          { x: (tr.x + tr.width / 2) * scaleX, y: (tr.y + tr.height / 2) * scaleY },
+          { x: (br.x + br.width / 2) * scaleX, y: (br.y + br.height / 2) * scaleY },
+          { x: (bl.x + bl.width / 2) * scaleX, y: (bl.y + bl.height / 2) * scaleY },
+        ];
+        ctx.beginPath();
+        ctx.lineWidth = 5;
+        ctx.globalAlpha = 0.8;
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i <= 4; i++) {
+          ctx.lineTo(pts[i % 4].x, pts[i % 4].y);
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
       }
-    }
-    await snap("corners", anchorMat, "Geometric Anchors");
-    anchorMat.delete();
+    });
 
     // REAL PROCESSING: Create the final clean warped mat
     let warped = src.clone();
@@ -415,16 +424,25 @@ function App() {
     }
     await snap("warped", warped, "Perspective Correction");
 
-    // Visual Stage: Grid Mapping / Text Block Analysis (DRAWN ON CLONE ONLY)
-    const gridMat = warped.clone();
-    const stepW = warped.cols / 8;
-    const stepH = warped.rows / 8;
-    for (let i = 1; i < 8; i++) {
-      cv.line(gridMat, new cv.Point(i * stepW, 0), new cv.Point(i * stepW, warped.rows), [14, 165, 233, 150], 2);
-      cv.line(gridMat, new cv.Point(0, i * stepH), new cv.Point(warped.cols, i * stepH), [14, 165, 233, 150], 2);
-    }
-    await snap("blocks", gridMat, "Segment Mapping");
-    gridMat.delete();
+    // Visual Stage: Grid Mapping / Text Block Analysis (Drawn on Canvas via decorator)
+    await snap("blocks", warped, "Segment Mapping", 800, (ctx, c) => {
+      const stepW = c.width / 8;
+      const stepH = c.height / 8;
+      ctx.strokeStyle = "#0ea5e9";
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.6;
+      for (let i = 1; i < 8; i++) {
+        ctx.beginPath();
+        ctx.moveTo(i * stepW, 0);
+        ctx.lineTo(i * stepW, c.height);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(0, i * stepH);
+        ctx.lineTo(c.width, i * stepH);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1.0;
+    });
 
     setCurrentStep("extracting");
     const DIM = { rows: 8, cols: 8, rGap: 40, cGap: 14 };
