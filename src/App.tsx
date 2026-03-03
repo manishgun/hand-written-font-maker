@@ -691,7 +691,7 @@ function App() {
                     <p className="text-base font-bold text-slate-700">
                       Drop scan or <span className="text-sky-500 underline decoration-2 underline-offset-4">browse</span>
                     </p>
-                    <p className="text-xs text-slate-400 mt-2">PNG / JPG · 8×8 character grid</p>
+                    <p className="text-xs text-slate-400 mt-2">PNG / JPG · 9×11 character grid</p>
                     <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
                   </label>
                 ) : (
