@@ -72,7 +72,7 @@ const TYPE_SEQUENCE = [
   "q",
 ];
 
-type Step = "idle" | "grayscale" | "threshold" | "edges" | "warped" | "extracting" | "done";
+type Step = "idle" | "grayscale" | "denoise" | "contrast" | "threshold" | "edges" | "corners" | "warped" | "blocks" | "extracting" | "done";
 
 interface Glyph {
   type: string;
@@ -336,13 +336,25 @@ function App() {
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
     await snap("grayscale", gray, "Grayscale");
 
+    // Visual Stage: Denoise
+    const blurred = new cv.Mat();
+    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+    await snap("denoise", blurred, "Antialiasing");
+    blurred.delete();
+
+    // Visual Stage: Contrast
+    const contrast = new cv.Mat();
+    gray.convertTo(contrast, -1, 1.4, 0);
+    await snap("contrast", contrast, "Luma Correction");
+    contrast.delete();
+
     const thresh = new cv.Mat();
     cv.threshold(gray, thresh, 120, 255, cv.THRESH_BINARY_INV);
     await snap("threshold", thresh, "Threshold");
 
     const edges = new cv.Mat();
     cv.Canny(gray, edges, 50, 150);
-    await snap("edges", edges, "Edge Map");
+    await snap("edges", edges, "Edge Topology");
 
     const contours = new cv.MatVector(),
       hier = new cv.Mat();
@@ -359,8 +371,34 @@ function App() {
       approx.delete();
     }
 
-    let warped = src.clone();
+    // Visual Stage: Anchor Detection (Boundary on those 4 blocks)
+    const anchorMat = src.clone();
+    rects.forEach((r) => {
+      const p1 = new cv.Point(r.x, r.y);
+      const p2 = new cv.Point(r.x + r.width, r.y + r.height);
+      cv.rectangle(anchorMat, p1, p2, [14, 165, 233, 255], 8);
+    });
+    // Draw lines between detected corners to show boundary
+    if (rects.length === 4) {
+      const tl = rects.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
+      const tr = rects.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
+      const br = rects.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
+      const bl = rects.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
+      const pts = [
+        new cv.Point(tl.x + tl.width / 2, tl.y + tl.height / 2),
+        new cv.Point(tr.x + tr.width / 2, tr.y + tr.height / 2),
+        new cv.Point(br.x + br.width / 2, br.y + br.height / 2),
+        new cv.Point(bl.x + bl.width / 2, bl.y + bl.height / 2),
+      ];
+      for (let i = 0; i < 4; i++) {
+        cv.line(anchorMat, pts[i], pts[(i + 1) % 4], [14, 165, 233, 200], 5);
+      }
+    }
+    await snap("corners", anchorMat, "Geometric Anchors");
+    anchorMat.delete();
 
+    // REAL PROCESSING: Create the final clean warped mat
+    let warped = src.clone();
     if (rects.length === 4) {
       const tl = rects.reduce((a, b) => (a.x + a.y < b.x + b.y ? a : b));
       const tr = rects.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
@@ -375,12 +413,23 @@ function App() {
       s.delete();
       d.delete();
     }
-    await snap("warped", warped, "Perspective");
+    await snap("warped", warped, "Perspective Correction");
+
+    // Visual Stage: Grid Mapping / Text Block Analysis (DRAWN ON CLONE ONLY)
+    const gridMat = warped.clone();
+    const stepW = warped.cols / 8;
+    const stepH = warped.rows / 8;
+    for (let i = 1; i < 8; i++) {
+      cv.line(gridMat, new cv.Point(i * stepW, 0), new cv.Point(i * stepW, warped.rows), [14, 165, 233, 150], 2);
+      cv.line(gridMat, new cv.Point(0, i * stepH), new cv.Point(warped.cols, i * stepH), [14, 165, 233, 150], 2);
+    }
+    await snap("blocks", gridMat, "Segment Mapping");
+    gridMat.delete();
 
     setCurrentStep("extracting");
     const DIM = { rows: 8, cols: 8, rGap: 40, cGap: 14 };
-    const w = (canvas.width - (DIM.cols + 1) * DIM.cGap) / DIM.cols;
-    const h = (canvas.height - (DIM.rows + 1) * DIM.rGap) / DIM.rows;
+    const w = (warped.cols - (DIM.cols + 1) * DIM.cGap) / DIM.cols;
+    const h = (warped.rows - (DIM.rows + 1) * DIM.rGap) / DIM.rows;
     let idx = 0;
     const extracted: Glyph[] = [];
 
@@ -391,9 +440,17 @@ function App() {
           const x = (c + 1) * DIM.cGap + c * w,
             y = (r + 1) * DIM.rGap + r * h;
           const cc = document.createElement("canvas");
-          cc.width = w * 2.5;
-          cc.height = h * 2.5;
-          cc.getContext("2d")!.drawImage(canvas, x, y + 2, w - 2, h - 2, 0, 0, w * 2.5, h * 2.5);
+          cc.width = Math.round(w * 2.5);
+          cc.height = Math.round(h * 2.5);
+
+          // Extract directly from the warped Mat to avoid visual artifacts from the display canvas
+          const roi = warped.roi(new cv.Rect(x, y + 2, w - 2, h - 2));
+          const tmpMat = new cv.Mat();
+          cv.resize(roi, tmpMat, new cv.Size(cc.width, cc.height), 0, 0, cv.INTER_LANCZOS4);
+          cv.imshow(cc, tmpMat);
+          roi.delete();
+          tmpMat.delete();
+
           const originalImg = cc.toDataURL("image/png");
           const svg = await new Promise<string>((res) => Potrace.trace(originalImg, (_, r) => res(r || "")));
           if (svg) {
@@ -657,55 +714,44 @@ function App() {
         </section>
 
         {/* ── Section 2: Processing Pipeline ────────────────────────────── */}
-        <section className="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
-          <div className="px-6 py-4 border-b border-slate-50 flex items-center justify-between">
-            <h2 className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Processing Pipeline</h2>
-            <div>
-              {isProcessing && (
-                <span className="text-[11px] font-semibold text-sky-500 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 bg-sky-500 rounded-full animate-pulse inline-block"></span>
-                  {currentStep}
-                </span>
-              )}
-              {isDone && (
-                <span className="text-[11px] font-semibold text-emerald-500 flex items-center gap-1">
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
-                  </svg>
-                  Complete — {glyphs.length} glyphs
-                </span>
-              )}
-            </div>
-          </div>
-
-          <div className="p-6">
-            {history.length <= 1 && !isProcessing ? (
-              <div className="h-32 flex flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-slate-100 bg-slate-50/50">
-                <svg className="w-6 h-6 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M4 6h16M4 12h16M4 18h7" />
-                </svg>
-                <p className="text-xs text-slate-400">Pipeline stages will appear here as the neural logic runs.</p>
+        {(isProcessing || history.length > 1) && (
+          <section className="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden animate-fade-in-up">
+            <div className="px-6 py-4 border-b border-slate-50 flex items-center justify-between">
+              <h2 className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Processing Pipeline</h2>
+              <div>
+                {isProcessing && (
+                  <span className="text-[11px] font-semibold text-sky-500 flex items-center gap-1.5">
+                    <span className="w-1.5 h-1.5 bg-sky-500 rounded-full animate-pulse inline-block"></span>
+                    {currentStep}
+                  </span>
+                )}
+                {isDone && (
+                  <span className="text-[11px] font-semibold text-emerald-500 flex items-center gap-1">
+                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
+                    </svg>
+                    Complete — {glyphs.length} glyphs
+                  </span>
+                )}
               </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+            </div>
+
+            <div className="p-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
                 {history.map((snap, i) => (
                   <div key={i} className="flex flex-col gap-4 group/stage cursor-default animate-fade-in-up" style={{ animationDelay: `${i * 100}ms` }}>
                     <div className="relative overflow-hidden rounded-2xl border border-slate-100 bg-slate-100 shadow-sm group-hover/stage:border-sky-200 group-hover/stage:shadow-xl group-hover/stage:-translate-y-1 transition-all duration-500">
-                      <img
-                        src={snap.image}
-                        className="w-full aspect-[4/5] object-cover grayscale opacity-70 group-hover/stage:grayscale-0 group-hover/stage:opacity-100 transition-all duration-700"
-                        alt={snap.name}
-                      />
+                      <img src={snap.image} className="w-full aspect-[4/5] object-cover transition-all duration-700" alt={snap.name} />
                       <div className="absolute top-4 left-4">
                         <span
                           className={`text-[10px] font-black px-2.5 py-1.5 rounded-lg text-white uppercase tracking-[0.1em] shadow-lg ${i === 0 ? "bg-slate-900/80" : "bg-sky-500/90"} backdrop-blur-md`}>
-                          {i === 0 ? "Source Scan" : `Process 0${i}`}
+                          {i === 0 ? "Source Scan" : `Process ${i < 10 ? "0" : ""}${i}`}
                         </span>
                       </div>
                       <div className="absolute inset-0 ring-1 ring-inset ring-black/5 rounded-2xl"></div>
                     </div>
                     <div className="flex flex-col items-center">
-                      <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest group-hover/stage:text-sky-500 transition-colors">
+                      <span className="text-[11px] font-black text-slate-400 uppercase tracking-widest group-hover/stage:text-sky-500 transition-colors text-center">
                         {snap.name}
                       </span>
                       <div className="w-8 h-1 bg-slate-100 mt-2 rounded-full group-hover/stage:w-16 group-hover/stage:bg-sky-500 transition-all duration-500"></div>
@@ -713,10 +759,10 @@ function App() {
                   </div>
                 ))}
                 {isProcessing &&
-                  Array.from({ length: Math.max(0, 3 - (history.length % 3 || 3)) }).map((_, i) => (
+                  Array.from({ length: Math.max(0, 4 - (history.length % 4 || 4)) }).map((_, i) => (
                     <div key={i} className="flex flex-col gap-4 animate-pulse">
                       <div className="aspect-[4/5] rounded-2xl border-2 border-dashed border-slate-200 bg-slate-50/50 flex items-center justify-center">
-                        <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Awaiting Neural Step...</span>
+                        <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Neural Phase...</span>
                       </div>
                       <div className="flex flex-col items-center">
                         <div className="h-3 w-32 bg-slate-100 rounded-full"></div>
@@ -725,9 +771,9 @@ function App() {
                     </div>
                   ))}
               </div>
-            )}
-          </div>
-        </section>
+            </div>
+          </section>
+        )}
 
         {/* ── Section 3: Character Inventory ────────────────────────────── */}
         {(glyphs.length > 0 || isProcessing) && (
