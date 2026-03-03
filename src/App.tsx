@@ -571,7 +571,7 @@ function App() {
     if (!buf) return;
 
     // Start audio early to compensate for latency
-    const audio = new Audio("/confetti-gun.mp3");
+    const audio = new Audio(`${import.meta.env.BASE_URL}confetti-gun.mp3`);
     audio.play().catch(() => {});
 
     const name = `UF_${Math.random().toString(36).substr(2, 8)}`;
