@@ -1,6 +1,6 @@
 # Hand Writing Font 🖋️
 
-![Hand Writing Font Thumbnail](https://via.placeholder.com/1280x640?text=Hand+Writing+Font+Preview)
+![Hand Writing Font Thumbnail](https://raw.githubusercontent.com/manishgun/hand-written-font-maker/refs/heads/main/public/screenshot.png)
 
 **Hand Writing Font** is a high-performance, browser-based neural extraction engine that converts your handwritten character scans into professional, vector-based `.TTF` font files in real-time.
 
