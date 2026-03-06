@@ -303,26 +303,143 @@ function App() {
     await snap("contrast", contrast, "Luma Correction");
 
     const thresh = new cv.Mat();
-    cv.threshold(gray, thresh, 120, 255, cv.THRESH_BINARY_INV);
+    // Use an adaptive block size based on image resolution
+    const adaptiveBlockSize = Math.floor(Math.min(src.cols, src.rows) / 100) * 2 + 1;
+    cv.adaptiveThreshold(gray, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, Math.max(11, adaptiveBlockSize), 10);
     await snap("threshold", thresh, "Threshold");
 
-    const edges = new cv.Mat();
-    cv.Canny(gray, edges, 50, 150);
-    await snap("edges", edges, "Edge Topology");
 
-    const contours = new cv.MatVector();
-    const hier = new cv.Mat();
-    cv.findContours(edges, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    const rects: opencv.Rect[] = [];
-    for (let i = 0; i < contours.size(); i++) {
-      const cnt = contours.get(i),
-        approx = new cv.Mat();
-      cv.approxPolyDP(cnt, approx, 0.02 * cv.arcLength(cnt, true), true);
-      if (approx.rows === 4 && cv.isContourConvex(approx)) {
-        const r = cv.boundingRect(cnt);
-        if (r.width > 20 && r.width < 140 && r.height > 20 && r.height < 150) rects.push(r);
+    // ─── Marker Detection 3.0 ──────────────────────────────────────────
+    // Add 2px padding to handle markers touching the edge
+    const padded = new cv.Mat();
+    cv.copyMakeBorder(thresh, padded, 2, 2, 2, 2, cv.BORDER_CONSTANT, new cv.Scalar(0));
+
+    const pContours = new cv.MatVector();
+    const pHier = new cv.Mat();
+    cv.findContours(padded, pContours, pHier, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
+
+    const candidates: { r: opencv.Rect; score: number; index: number }[] = [];
+    const minMSize = Math.min(src.cols, src.rows) * 0.005; // Loosened from 0.01
+    const maxMSize = Math.min(src.cols, src.rows) * 0.3;
+
+    for (let i = 0; i < pContours.size(); i++) {
+      const cnt = pContours.get(i);
+      const r = cv.boundingRect(cnt);
+      // Correct for padding
+      r.x -= 2;
+      r.y -= 2;
+
+      const area = cv.contourArea(cnt);
+
+
+      if (r.width < minMSize || r.height < minMSize || r.width > maxMSize || r.height > maxMSize) continue;
+
+      const aspectRatio = r.width / r.height;
+      if (aspectRatio < 0.6 || aspectRatio > 1.6) continue;
+
+      const extent = area / (r.width * r.height);
+      if (extent < 0.3) continue;
+
+
+
+      // Level 2 Hierarchy (at least one child) is worth scoring
+      const hData = pHier.intPtr(0, i);
+      const childIdx = hData[2];
+      if (childIdx === -1) continue;
+
+      let markerScore = (1.0 - Math.abs(1.0 - aspectRatio)) * extent;
+
+      // Check for Grandchild (Square-in-Square-in-Square)
+      const childHData = pHier.intPtr(0, childIdx);
+      const grandchildIdx = childHData[2];
+
+      if (grandchildIdx !== -1) {
+        const grandchildArea = cv.contourArea(pContours.get(grandchildIdx));
+        // Ensure grandchild is a meaningful part of the marker, not a speck
+        if (grandchildArea > area * 0.05) {
+          markerScore *= 3.0; // Huge boost for perfect signature
+        }
       }
-      approx.delete();
+
+      candidates.push({ r, score: markerScore, index: i });
+    }
+
+    padded.delete();
+    pContours.delete();
+    pHier.delete();
+
+    // Select the best 4 markers
+    let rects: opencv.Rect[] = [];
+
+    if (candidates.length >= 4) {
+      // Sort by score and take top candidates
+      candidates.sort((a, b) => b.score - a.score);
+      const topCandidates = candidates.slice(0, 12); // Consider top 12 scorers
+
+      // Heuristic: Pick 4 candidates that form the largest bounding box area
+      // (This naturally picks the 4 corners of the page)
+      let maxArea = -1;
+      let bestCombo: opencv.Rect[] = [];
+
+      for (let i = 0; i < topCandidates.length; i++) {
+        for (let j = i + 1; j < topCandidates.length; j++) {
+          for (let k = j + 1; k < topCandidates.length; k++) {
+            for (let l = k + 1; l < topCandidates.length; l++) {
+              const rs = [topCandidates[i].r, topCandidates[j].r, topCandidates[k].r, topCandidates[l].r];
+              const minX = Math.min(...rs.map(r => r.x));
+              const maxX = Math.max(...rs.map(r => r.x + r.width));
+              const minY = Math.min(...rs.map(r => r.y));
+              const maxY = Math.max(...rs.map(r => r.y + r.height));
+              const comboArea = (maxX - minX) * (maxY - minY);
+
+              // Also weight by the sum of scores
+              const totalScore = rs.reduce((acc, _, idx) => acc + [topCandidates[i], topCandidates[j], topCandidates[k], topCandidates[l]][idx].score, 0);
+              const combinedMetric = comboArea * totalScore;
+
+              if (combinedMetric > maxArea) {
+                maxArea = combinedMetric;
+                bestCombo = rs;
+              }
+            }
+          }
+        }
+      }
+      rects = bestCombo;
+    } else if (candidates.length === 3) {
+      // ... (existing 3-marker recovery logic remains)
+      const imgW = src.cols, imgH = src.rows;
+      const idealCorners = [
+        { name: 'tl', x: 0, y: 0 },
+        { name: 'tr', x: imgW, y: 0 },
+        { name: 'br', x: imgW, y: imgH },
+        { name: 'bl', x: 0, y: imgH }
+      ];
+      const assigned: Record<string, opencv.Rect | null> = { tl: null, tr: null, br: null, bl: null };
+      const usedCandidates = new Set();
+      idealCorners.forEach(corner => {
+        let best: any = null;
+        let minDist = Infinity;
+        candidates.forEach((c, idx) => {
+          if (usedCandidates.has(idx)) return;
+          const cx = c.r.x + c.r.width / 2, cy = c.r.y + c.r.height / 2;
+          const d = Math.sqrt((cx - corner.x) ** 2 + (cy - corner.y) ** 2);
+          if (d < minDist) { minDist = d; best = { r: c.r, idx }; }
+        });
+        if (best) { assigned[corner.name] = best.r; usedCandidates.add(best.idx); }
+      });
+
+      if (!assigned.tl && assigned.tr && assigned.br && assigned.bl) {
+        assigned.tl = { x: assigned.tr!.x + assigned.bl!.x - assigned.br!.x, y: assigned.tr!.y + assigned.bl!.y - assigned.br!.y, width: assigned.br!.width, height: assigned.br!.height } as any;
+      } else if (!assigned.tr && assigned.tl && assigned.br && assigned.bl) {
+        assigned.tr = { x: assigned.tl!.x + assigned.br!.x - assigned.bl!.x, y: assigned.tl!.y + assigned.br!.y - assigned.bl!.y, width: assigned.bl!.width, height: assigned.bl!.height } as any;
+      } else if (!assigned.br && assigned.tl && assigned.tr && assigned.bl) {
+        assigned.br = { x: assigned.tr!.x + assigned.bl!.x - assigned.tl!.x, y: assigned.tr!.y + assigned.bl!.y - assigned.tl!.y, width: assigned.tl!.width, height: assigned.tl!.height } as any;
+      } else if (!assigned.bl && assigned.tl && assigned.tr && assigned.br) {
+        assigned.bl = { x: assigned.tl!.x + assigned.br!.x - assigned.tr!.x, y: assigned.tl!.y + assigned.br!.y - assigned.tr!.y, width: assigned.tr!.width, height: assigned.tr!.height } as any;
+      }
+      rects = Object.values(assigned).filter(Boolean) as opencv.Rect[];
+    } else {
+      rects = candidates.map(c => c.r);
     }
 
     // Visual Stage: Anchor Detection (Drawn on Canvas via decorator to keep 'src' pure)
@@ -362,7 +479,7 @@ function App() {
     // REAL PROCESSING: Create the final clean warped mat
     let warped = src.clone();
 
-    // console.log(rects);
+    console.log(rects);
 
     // if (rects.length !== 4) return;
 
@@ -371,7 +488,29 @@ function App() {
       const tr = rects.reduce((a, b) => (a.x - a.y > b.x - b.y ? a : b));
       const br = rects.reduce((a, b) => (a.x + a.y > b.x + b.y ? a : b));
       const bl = rects.reduce((a, b) => (a.x - a.y < b.x - b.y ? a : b));
-      const s = cv.matFromArray(4, 1, cv.CV_32FC2, [tl.x, tl.y + tl.height, tr.x + tr.width, tr.y + tr.height, br.x + br.width, br.y, bl.x, bl.y]);
+
+      // Point 0 (TL): Top-left of the tl-rect -> (tl.x, tl.y)
+      // Point 1 (TR): Top-right of the tr-rect -> (tr.x + tr.width, tr.y)
+      // Point 2 (BR): Bottom-right of the br-rect -> (br.x + br.width, br.y + br.height)
+      // Point 3 (BL): Bottom-left of the bl-rect -> (bl.x, bl.y + bl.height)
+      const s = cv.matFromArray(4, 1, cv.CV_32FC2, [
+        tl.x, tl.y + tl.height,
+        tr.x + tr.width, tr.y + tr.height,
+        br.x + br.width, br.y,
+        bl.x, bl.y
+
+
+
+
+        // tl.x, 
+        // tl.y,
+        // tr.x + tr.width, 
+        // tr.y, 
+        // br.x + br.width, 
+        // br.y + br.height,
+        // bl.x, 
+        // bl.y + bl.height
+      ]);
       const d = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, 2400, 0, 2400, 3000, 0, 3000]);
       const M = cv.getPerspectiveTransform(s, d);
       warped = new cv.Mat();
@@ -387,8 +526,8 @@ function App() {
       const stepW = c.width / 9;
       const stepH = c.height / 11;
       ctx.strokeStyle = "#0ea5e9";
-      ctx.lineWidth = 2;
-      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 4;
+      ctx.globalAlpha = 0.9;
       for (let i = 1; i < 11; i++) {
         ctx.beginPath();
         ctx.moveTo(i * stepW, 0);
@@ -403,7 +542,7 @@ function App() {
     });
 
     setCurrentStep("extracting");
-    const DIM = { rows: 11, cols: 9, rGap: 100, cGap: 32 };
+    const DIM = { rows: 11, cols: 9, rGap: 0, cGap: 0 };
     const w = (warped.cols - (DIM.cols + 1) * DIM.cGap) / DIM.cols;
     const h = (warped.rows - (DIM.rows + 1) * DIM.rGap) / DIM.rows;
     let idx = 0;
@@ -413,13 +552,15 @@ function App() {
       for (let c = 0; c < DIM.cols; c++) {
         const char = TYPE_SEQUENCE[idx++];
         if (char) {
-          const x = (c + 1) * DIM.cGap + c * w,
-            y = (r + 1) * DIM.rGap + r * h;
+          // const x = (c + 1) * DIM.cGap + c * w;
+          // const y = (r + 1) * DIM.rGap + r * h;
+          const x = c * w;
+          const y = r * h;
           const cc = document.createElement("canvas");
           cc.width = Math.round(w * 2.5);
           cc.height = Math.round(h * 2.5);
 
-          const roi = warped.roi(new cv.Rect(x + 4, y + 16, w - 4, h - 4));
+          const roi = warped.roi(new cv.Rect(x + 4, y + 50, w - 4, h - 4));
           const tmpMat = new cv.Mat();
           cv.resize(roi, tmpMat, new cv.Size(cc.width, cc.height), 0, 0, cv.INTER_LANCZOS4);
           cv.imshow(cc, tmpMat);
@@ -446,9 +587,6 @@ function App() {
     setIsProcessing(false);
     gray.delete();
     thresh.delete();
-    edges.delete();
-    contours.delete();
-    hier.delete();
     warped.delete();
     blurred.delete();
     contrast.delete();
@@ -591,7 +729,7 @@ function App() {
 
     // Start audio early to compensate for latency
     const audio = new Audio(`${import.meta.env.BASE_URL}confetti-gun.mp3`);
-    audio.play().catch(() => {});
+    audio.play().catch(() => { });
 
     const name = `UF_${Math.random().toString(36).substr(2, 8)}`;
     try {
