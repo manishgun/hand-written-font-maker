@@ -6,7 +6,6 @@ import { DOMParser } from "xmldom";
 import svgpath from "svgpath";
 import confetti from "canvas-confetti";
 import { characters } from "./constants";
-import paper from "paper";
 
 const TYPE_SEQUENCE = characters;
 
@@ -643,8 +642,6 @@ function App() {
 
     const extracted: Glyph[] = [];
 
-    paper.setup(new paper.Size(1000, 1000));
-
     for (const ag of adjustableGlyphs) {
       // 1. Create a canvas to apply adjustments correctly
       const canvas = document.createElement("canvas");
@@ -668,28 +665,41 @@ function App() {
       ctx.drawImage(img, -img.width / 2, -img.height / 2);
       ctx.restore();
 
-      const adjustedImg = canvas.toDataURL("image/png");
+      // 2b. Crop an inner margin to strip cell-border artifacts (grid lines, corner
+      // smudges) that binarization cannot distinguish from real ink. A 4% margin
+      // on each side removes the noise band without touching the character body.
+      const MARGIN = Math.round(canvas.width * 0.04);
+      const innerW = canvas.width - MARGIN * 2;
+      const innerH = canvas.height - MARGIN * 2;
+      const croppedCanvas = document.createElement("canvas");
+      croppedCanvas.width = innerW;
+      croppedCanvas.height = innerH;
+      croppedCanvas.getContext("2d")!.drawImage(canvas, MARGIN, MARGIN, innerW, innerH, 0, 0, innerW, innerH);
 
-      // 3. Trace SVG from the ADJUSTED image
-      const svg = await new Promise<string>((res) => Potrace.trace(adjustedImg, { turdSize: 160 }, (_, r) => res(r || "")));
+      const adjustedImg = croppedCanvas.toDataURL("image/png");
+
+      // 3. Trace SVG — blackOnWhite:true tells Potrace to trace dark ink on light
+      // background. threshold is 0-255 in this library; 128 is the neutral midpoint.
+      const svg = await new Promise<string>((res) =>
+        Potrace.trace(adjustedImg, { turdSize: 180, threshold: 180, blackOnWhite: true, alphaMax: 1.0, optCurve: true, optTolerance: 0.2 }, (_, r) =>
+          res(r || ""),
+        ),
+      );
       if (svg) {
-        const item = paper.project.importSVG(svg);
+        // Potrace already produces clean, well-formed SVG paths with correct winding.
+        // We parse the SVG directly to extract the viewBox and all <path> elements,
+        // then reassemble — no Paper.js unite/simplify which destroys stroke fidelity
+        // by merging counters (holes) into blobs and over-rounding fine details.
+        const potraceDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
+        const potraceSvgEl = potraceDoc.getElementsByTagName("svg")[0];
+        const viewBox = potraceSvgEl?.getAttribute("viewBox") ?? `0 0 ${canvas.width} ${canvas.height}`;
+        const svgWidth = potraceSvgEl?.getAttribute("width") ?? String(canvas.width);
+        const svgHeight = potraceSvgEl?.getAttribute("height") ?? String(canvas.height);
 
-        const paths: paper.PathItem[] = [];
-
-        item.getItems({ class: paper.PathItem }).forEach((p) => paths.push(p as paper.PathItem));
-
-        let merged: paper.PathItem = paths[0].clone();
-
-        for (let i = 1; i < paths.length; i++) {
-          merged = merged.unite(paths[i]) as paper.PathItem;
-        }
-
-        merged.simplify(0.5);
-
-        const cleanSvg = merged.exportSVG({ asString: true }) as string;
-
-        paper.project.clear();
+        // Collect all path data from Potrace output, preserving every sub-path
+        const pathEls = Array.from(potraceDoc.getElementsByTagName("path"));
+        const pathsMarkup = pathEls.map((p) => p.outerHTML ?? `<path d="${p.getAttribute("d") ?? ""}" />`).join("");
+        const cleanSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="${viewBox}">${pathsMarkup}</svg>`;
 
         // Use adjustedImg for the inventory preview so user sees their work
         const g = { type: ag.character, svg: cleanSvg, originalImg: adjustedImg };
@@ -753,18 +763,30 @@ function App() {
       // THEN split. Each piece now starts with an absolute `M`.
       const absD = svgpath(rawD).abs().toString();
 
+      // Determine outer vs hole purely by winding area after Y-flip, not by index.
+      // Potrace can emit multiple top-level outer paths (e.g. g, j have a body +
+      // a descender loop — both are outer). Using subIdx===0 as "outer" is wrong;
+      // it forces the 2nd outer path to be treated as a hole → filled solid.
+      //
+      // Potrace winds: outer=CCW, hole=CW in SVG (Y-down).
+      // After scale(1,-1) Y-flip: outer→CW (area<0), hole→CCW (area>0).
+      // Both are already correct for OpenType — just emit as-is, no reversal.
       const path = new opentype.Path();
-      splitSubPaths(absD).forEach((subD, subIdx) => {
+      splitSubPaths(absD).forEach((subD) => {
         const transformed = svgpath(subD).abs().translate(-minX, 0).scale(scale, -scale).translate(0, 800);
         const segs: any[] = [];
         transformed.iterate((seg: any) => segs.push([...seg]));
         if (!segs.length) return;
+        // After Y-flip: outer contours have negative area, holes have positive area.
+        // Both are already correct for OpenType — no reversal needed.
+        // Only reverse if a contour ended up with the wrong sign (shouldn't happen
+        // with well-formed Potrace output, but guard anyway).
         const area = signedArea(flattenSegments(segs));
-        const isOuter = subIdx === 0;
-        let final = segs;
-        if (isOuter && area > 0) final = reverseContour(segs);
-        else if (!isOuter && area < 0) final = reverseContour(segs);
-        emitToPath(path, final);
+        // area < 0 → CW → outer (correct for OpenType outer)
+        // area > 0 → CCW → hole (correct for OpenType hole)
+        // area === 0 → degenerate, skip
+        if (area === 0) return;
+        emitToPath(path, segs);
       });
       ogs.push(new opentype.Glyph({ name: g.type, unicode: g.type.charCodeAt(0), advanceWidth: Math.round((maxX - minX) * scale + 60), path }));
     });
