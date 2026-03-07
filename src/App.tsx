@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import opencv from "@techstark/opencv-js";
 import Potrace from "potrace";
 import opentype from "opentype.js";
@@ -206,6 +206,356 @@ function emitToPath(path: opentype.Path, segs: any[]): void {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// OpenCV-based glyph tracer
+// Replaces Potrace: uses cv.findContours (RETR_CCOMP) so outer/hole hierarchy
+// is known structurally — no winding math guesswork.
+// Contours are smoothed with approxPolyDP then promoted to cubic beziers via
+// Catmull-Rom → cubic conversion for smooth curves.
+// ──────────────────────────────────────────────────────────────────────────────
+
+function catmullToCubic(
+  p0: { x: number; y: number },
+  p1: { x: number; y: number },
+  p2: { x: number; y: number },
+  p3: { x: number; y: number },
+): [number, number, number, number, number, number] {
+  // Convert a Catmull-Rom segment (p1→p2) to a cubic bezier
+  const alpha = 1 / 6;
+  return [p1.x + alpha * (p2.x - p0.x), p1.y + alpha * (p2.y - p0.y), p2.x - alpha * (p3.x - p1.x), p2.y - alpha * (p3.y - p1.y), p2.x, p2.y];
+}
+
+function contourToSVGPath(pts: { x: number; y: number }[], close = true): string {
+  if (pts.length < 2) return "";
+  const n = pts.length;
+  let d = `M ${pts[0].x} ${pts[0].y} `;
+  for (let i = 0; i < n; i++) {
+    const p0 = pts[(i - 1 + n) % n];
+    const p1 = pts[i % n];
+    const p2 = pts[(i + 1) % n];
+    const p3 = pts[(i + 2) % n];
+    const [c1x, c1y, c2x, c2y, ex, ey] = catmullToCubic(p0, p1, p2, p3);
+    d += `C ${c1x.toFixed(2)} ${c1y.toFixed(2)} ${c2x.toFixed(2)} ${c2y.toFixed(2)} ${ex.toFixed(2)} ${ey.toFixed(2)} `;
+  }
+  if (close) d += "Z";
+  return d.trim();
+}
+
+function traceGlyphWithOpenCV(cv: typeof opencv, croppedCanvas: HTMLCanvasElement): string {
+  const w = croppedCanvas.width;
+  const h = croppedCanvas.height;
+
+  // Read image into OpenCV
+  const src = cv.imread(croppedCanvas);
+
+  // Convert to grayscale
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+  // Threshold: Otsu finds the optimal cut between ink and background
+  const binary = new cv.Mat();
+  cv.threshold(gray, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+
+  // Light denoise: remove specks smaller than ~3x3
+  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
+  const cleaned = new cv.Mat();
+  cv.morphologyEx(binary, cleaned, cv.MORPH_OPEN, kernel);
+
+  // Find contours with full 2-level hierarchy (RETR_CCOMP)
+  // Level 0 = outer fill contours, Level 1 = hole contours inside them
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  cv.findContours(cleaned, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_NONE);
+
+  const minArea = w * h * 0.0003; // ignore specks < 0.03% of cell area
+
+  // Build paths: walk the hierarchy
+  // hierarchy[i] = [next, prev, firstChild, parent]
+  // parent === -1  → outer contour (level 0)
+  // parent !== -1  → hole contour  (level 1)
+  const pathParts: string[] = [];
+
+  for (let i = 0; i < (contours.size() as unknown as number); i++) {
+    const cnt = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < minArea) {
+      cnt.delete();
+      continue;
+    }
+
+    const hData = hierarchy.intPtr(0, i);
+    const isHole = hData[3] !== -1; // has a parent → hole
+
+    // Smooth the contour
+    const approx = new cv.Mat();
+    const epsilon = 0.5; // tighter = more faithful to original stroke
+    cv.approxPolyDP(cnt, approx, epsilon, true);
+
+    const pts: { x: number; y: number }[] = [];
+    for (let j = 0; j < approx.rows; j++) {
+      pts.push({ x: approx.data32S[j * 2], y: approx.data32S[j * 2 + 1] });
+    }
+    approx.delete();
+    cnt.delete();
+
+    if (pts.length < 3) continue;
+
+    // Enforce winding: OpenType outer=CW(Y-up)=CCW(Y-down), hole=CCW(Y-up)=CW(Y-down)
+    // In image space (Y-down), outer must be CCW, hole must be CW
+    let area2 = 0;
+    for (let j = 0; j < pts.length; j++) {
+      const a = pts[j],
+        b = pts[(j + 1) % pts.length];
+      area2 += a.x * b.y - b.x * a.y;
+    }
+    const isCCW = area2 > 0; // positive shoelace = CCW in Y-down
+    if (!isHole && !isCCW) pts.reverse(); // outer must be CCW in Y-down
+    if (isHole && isCCW) pts.reverse(); // hole must be CW in Y-down
+
+    pathParts.push(contourToSVGPath(pts, true));
+  }
+
+  // Cleanup
+  src.delete();
+  gray.delete();
+  binary.delete();
+  kernel.delete();
+  cleaned.delete();
+  contours.delete();
+  hierarchy.delete();
+
+  if (pathParts.length === 0) return "";
+
+  const allD = pathParts.join(" ");
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><path d="${allD}" fill="black" fill-rule="nonzero"/></svg>`;
+}
+
+// ── GlyphCard ─────────────────────────────────────────────────────────────────
+// Drag is handled by tracking live position in a ref (livePos) and updating
+// React state ONLY on mouseup — avoiding the removeChild crash that happens
+// when React tries to reconcile nodes we mutated directly via imgRef.
+// The image transform reads from React state normally; during drag we use
+// requestAnimationFrame to flush the committed state fast enough to feel instant.
+interface GlyphCardProps {
+  ag: AdjustableGlyph;
+  i: number;
+  onUpdate: (i: number, updates: Partial<AdjustableGlyph>) => void;
+}
+
+function GlyphCard({ ag, i, onUpdate }: GlyphCardProps) {
+  // livePos: tracks drag position without triggering re-renders
+  const livePos = useRef({ x: ag.xOffset, y: ag.yOffset });
+  const isDragging = useRef(false);
+  const overlayRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef<number>(0);
+
+  // Keep livePos in sync when parent updates (slider, reset)
+  useEffect(() => {
+    livePos.current = { x: ag.xOffset, y: ag.yOffset };
+    // Sync overlay text when React state changes (slider / reset) — safe because no JSX children
+    if (overlayRef.current) {
+      const x = ag.xOffset,
+        y = ag.yOffset;
+      overlayRef.current.textContent = `${x >= 0 ? "+" : ""}${Math.round(x)}, ${y >= 0 ? "+" : ""}${Math.round(y)}`;
+    }
+  }, [ag.xOffset, ag.yOffset]);
+
+  const startDrag = useCallback(
+    (clientX: number, clientY: number, rectW: number, rectH: number) => {
+      isDragging.current = true;
+      const startXOff = ag.xOffset;
+      const startYOff = ag.yOffset;
+
+      const updateOverlay = (nx: number, ny: number) => {
+        if (overlayRef.current) {
+          overlayRef.current.textContent = `${nx >= 0 ? "+" : ""}${Math.round(nx)}, ${ny >= 0 ? "+" : ""}${Math.round(ny)}`;
+          overlayRef.current.style.opacity = "1";
+        }
+      };
+
+      const onMove = (cx: number, cy: number) => {
+        const dx = ((cx - clientX) / rectW) * 100;
+        const dy = ((cy - clientY) / rectH) * 100;
+        const nx = Math.max(-50, Math.min(50, startXOff + dx));
+        const ny = Math.max(-50, Math.min(50, startYOff + dy));
+        livePos.current = { x: nx, y: ny };
+        // Batch overlay update in rAF — smooth but never touches React-owned nodes
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = requestAnimationFrame(() => updateOverlay(nx, ny));
+        // Commit to React via onUpdate on every move — React batches these efficiently
+        onUpdate(i, { xOffset: nx, yOffset: ny });
+      };
+
+      const commit = () => {
+        isDragging.current = false;
+        cancelAnimationFrame(rafRef.current);
+        window.removeEventListener("mousemove", mm);
+        window.removeEventListener("mouseup", mu);
+        window.removeEventListener("touchmove", tm);
+        window.removeEventListener("touchend", te);
+      };
+
+      const mm = (e: MouseEvent) => onMove(e.clientX, e.clientY);
+      const mu = () => commit();
+      const tm = (e: TouchEvent) => {
+        e.preventDefault();
+        onMove(e.touches[0].clientX, e.touches[0].clientY);
+      };
+      const te = () => commit();
+      window.addEventListener("mousemove", mm);
+      window.addEventListener("mouseup", mu);
+      window.addEventListener("touchmove", tm, { passive: false });
+      window.addEventListener("touchend", te);
+    },
+    [ag.xOffset, ag.yOffset, i, onUpdate],
+  );
+
+  const onMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const r = e.currentTarget.getBoundingClientRect();
+      startDrag(e.clientX, e.clientY, r.width, r.height);
+    },
+    [startDrag],
+  );
+
+  const onTouchStart = useCallback(
+    (e: React.TouchEvent<HTMLDivElement>) => {
+      const r = e.currentTarget.getBoundingClientRect();
+      startDrag(e.touches[0].clientX, e.touches[0].clientY, r.width, r.height);
+    },
+    [startDrag],
+  );
+
+  const isDirty = ag.xOffset !== 0 || ag.yOffset !== 0 || ag.scale !== 1 || ag.rotation !== 0;
+
+  return (
+    <div className="bg-white border border-slate-100 rounded-2xl p-3 shadow-sm flex flex-col gap-2.5 hover:border-sky-200 hover:shadow-lg transition-all duration-200 group">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-xl font-black text-slate-900 leading-none w-6">{ag.character}</span>
+          <span className="text-[8px] font-semibold text-slate-300">#{i + 1}</span>
+        </div>
+        {isDirty && (
+          <button
+            onClick={() => onUpdate(i, { xOffset: 0, yOffset: 0, scale: 1, rotation: 0 })}
+            className="text-[8px] font-bold text-rose-400 hover:text-rose-600 px-1.5 py-0.5 rounded-md bg-rose-50 hover:bg-rose-100 transition-colors">
+            ↺ Reset
+          </button>
+        )}
+      </div>
+
+      {/* Drag zone — React owns the img node, guides are z-10 above it */}
+      <div
+        ref={containerRef}
+        className="aspect-square bg-gradient-to-br from-slate-50 to-slate-100/50 rounded-xl overflow-hidden flex items-center justify-center relative cursor-grab active:cursor-grabbing select-none border border-slate-100 group-hover:border-sky-200 transition-colors"
+        onMouseDown={onMouseDown}
+        onTouchStart={onTouchStart}>
+        {/* Background grid (z-0) */}
+        <div
+          className="absolute inset-0 z-0 pointer-events-none"
+          style={{
+            backgroundImage: "linear-gradient(rgba(14,165,233,0.05) 1px,transparent 1px),linear-gradient(90deg,rgba(14,165,233,0.05) 1px,transparent 1px)",
+            backgroundSize: "33.33% 33.33%",
+          }}
+        />
+
+        {/* Image — React-controlled transform, no direct DOM mutation */}
+        <img
+          src={ag.originalImg}
+          className="relative z-[1] max-w-[72%] max-h-[72%] object-contain pointer-events-none select-none"
+          style={{
+            transform: `translate(${ag.xOffset}%, ${ag.yOffset}%) scale(${ag.scale}) rotate(${ag.rotation}deg)`,
+            willChange: "transform",
+            transition: isDragging.current ? "none" : "transform 0.08s ease-out",
+          }}
+          draggable={false}
+          alt={ag.character}
+        />
+
+        {/* Crosshair guides — z-10 so they sit above the image */}
+        <div className="absolute z-10 top-1/2 left-0 w-full h-px bg-sky-400/25 pointer-events-none" />
+        <div className="absolute z-10 left-1/2 top-0 w-px h-full bg-sky-400/25 pointer-events-none" />
+
+        {/* Live XY overlay — intentionally NO JSX children so React never owns a text node here.
+             We write textContent directly. React only controls style/className on this div. */}
+        <div
+          ref={overlayRef}
+          className="absolute z-10 top-1.5 left-1.5 text-[7px] font-mono font-bold text-sky-500 bg-white/90 px-1.5 py-0.5 rounded-full border border-sky-100 shadow-sm pointer-events-none leading-none"
+          style={{ opacity: ag.xOffset !== 0 || ag.yOffset !== 0 ? 1 : 0, transition: "opacity 0.2s" }}
+        />
+
+        {/* Drag hint */}
+        <div className="absolute z-10 bottom-1.5 right-1.5 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+          <span className="text-[7px] font-bold text-slate-400 bg-white/80 px-1.5 py-0.5 rounded-full border border-slate-100">⠿ drag</span>
+        </div>
+      </div>
+
+      {/* Sliders */}
+      <div className="flex flex-col gap-1.5 px-0.5">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[8px] font-black text-slate-400 uppercase tracking-wider w-5 shrink-0">Sc</span>
+          <input
+            type="range"
+            min="0.4"
+            max="2.5"
+            step="0.05"
+            value={ag.scale}
+            onChange={(e) => onUpdate(i, { scale: parseFloat(e.target.value) })}
+            className="flex-1 h-[3px] rounded-full appearance-none cursor-pointer accent-sky-500 bg-slate-200"
+          />
+          <span className="text-[8px] font-bold text-sky-500 w-6 text-right tabular-nums">{ag.scale.toFixed(1)}</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <span className="text-[8px] font-black text-slate-400 uppercase tracking-wider w-5 shrink-0">Ro</span>
+          <input
+            type="range"
+            min="-45"
+            max="45"
+            step="1"
+            value={ag.rotation}
+            onChange={(e) => onUpdate(i, { rotation: parseFloat(e.target.value) })}
+            className="flex-1 h-[3px] rounded-full appearance-none cursor-pointer accent-sky-500 bg-slate-200"
+          />
+          <span className="text-[8px] font-bold text-sky-500 w-6 text-right tabular-nums">{ag.rotation}°</span>
+        </div>
+        <div className="grid grid-cols-2 gap-2 pt-1 mt-0.5 border-t border-slate-100">
+          <div className="flex flex-col gap-0.5">
+            <div className="flex justify-between items-center">
+              <span className="text-[8px] font-black text-slate-400 uppercase">X</span>
+              <span className="text-[8px] font-bold text-sky-500 tabular-nums">{Math.round(ag.xOffset)}</span>
+            </div>
+            <input
+              type="range"
+              min="-50"
+              max="50"
+              step="1"
+              value={ag.xOffset}
+              onChange={(e) => onUpdate(i, { xOffset: parseFloat(e.target.value) })}
+              className="w-full h-[3px] rounded-full appearance-none cursor-pointer accent-sky-500 bg-slate-200"
+            />
+          </div>
+          <div className="flex flex-col gap-0.5">
+            <div className="flex justify-between items-center">
+              <span className="text-[8px] font-black text-slate-400 uppercase">Y</span>
+              <span className="text-[8px] font-bold text-sky-500 tabular-nums">{Math.round(ag.yOffset)}</span>
+            </div>
+            <input
+              type="range"
+              min="-50"
+              max="50"
+              step="1"
+              value={ag.yOffset}
+              onChange={(e) => onUpdate(i, { yOffset: parseFloat(e.target.value) })}
+              className="w-full h-[3px] rounded-full appearance-none cursor-pointer accent-sky-500 bg-slate-200"
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function App() {
   const [cv, setCV] = useState<typeof opencv | null>(null);
@@ -220,6 +570,7 @@ function App() {
   const [appliedFontName, setAppliedFontName] = useState<string>("inherit");
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const inventoryRef = useRef<HTMLDivElement>(null);
+  const [previewFontSize, setPreviewFontSize] = useState(80);
 
   useEffect(() => {
     opencv.onRuntimeInitialized = () => setCV(opencv);
@@ -665,9 +1016,7 @@ function App() {
       ctx.drawImage(img, -img.width / 2, -img.height / 2);
       ctx.restore();
 
-      // 2b. Crop an inner margin to strip cell-border artifacts (grid lines, corner
-      // smudges) that binarization cannot distinguish from real ink. A 4% margin
-      // on each side removes the noise band without touching the character body.
+      // 2b. Crop a 4% margin to remove cell-border grid artifacts
       const MARGIN = Math.round(canvas.width * 0.04);
       const innerW = canvas.width - MARGIN * 2;
       const innerH = canvas.height - MARGIN * 2;
@@ -676,32 +1025,12 @@ function App() {
       croppedCanvas.height = innerH;
       croppedCanvas.getContext("2d")!.drawImage(canvas, MARGIN, MARGIN, innerW, innerH, 0, 0, innerW, innerH);
 
+      // 3. Trace with OpenCV contours — Otsu threshold + RETR_CCOMP hierarchy
+      // gives outer/hole classification for free, smooth bezier curves, no Potrace needed.
+      const cleanSvg = cv ? traceGlyphWithOpenCV(cv, croppedCanvas) : "";
       const adjustedImg = croppedCanvas.toDataURL("image/png");
 
-      // 3. Trace SVG — blackOnWhite:true tells Potrace to trace dark ink on light
-      // background. threshold is 0-255 in this library; 128 is the neutral midpoint.
-      const svg = await new Promise<string>((res) =>
-        Potrace.trace(adjustedImg, { turdSize: 180, threshold: 180, blackOnWhite: true, alphaMax: 1.0, optCurve: true, optTolerance: 0.2 }, (_, r) =>
-          res(r || ""),
-        ),
-      );
-      if (svg) {
-        // Potrace already produces clean, well-formed SVG paths with correct winding.
-        // We parse the SVG directly to extract the viewBox and all <path> elements,
-        // then reassemble — no Paper.js unite/simplify which destroys stroke fidelity
-        // by merging counters (holes) into blobs and over-rounding fine details.
-        const potraceDoc = new DOMParser().parseFromString(svg, "image/svg+xml");
-        const potraceSvgEl = potraceDoc.getElementsByTagName("svg")[0];
-        const viewBox = potraceSvgEl?.getAttribute("viewBox") ?? `0 0 ${canvas.width} ${canvas.height}`;
-        const svgWidth = potraceSvgEl?.getAttribute("width") ?? String(canvas.width);
-        const svgHeight = potraceSvgEl?.getAttribute("height") ?? String(canvas.height);
-
-        // Collect all path data from Potrace output, preserving every sub-path
-        const pathEls = Array.from(potraceDoc.getElementsByTagName("path"));
-        const pathsMarkup = pathEls.map((p) => p.outerHTML ?? `<path d="${p.getAttribute("d") ?? ""}" />`).join("");
-        const cleanSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="${viewBox}">${pathsMarkup}</svg>`;
-
-        // Use adjustedImg for the inventory preview so user sees their work
+      if (cleanSvg) {
         const g = { type: ag.character, svg: cleanSvg, originalImg: adjustedImg };
         extracted.push(g);
         setGlyphs((p) => [...p, g]);
@@ -752,41 +1081,39 @@ function App() {
         });
       if (minX === Infinity) return;
 
-      // ─── CRITICAL FIX ────────────────────────────────────────────────────
-      // Potrace outputs hole sub-paths as relative `m x y` commands, e.g.:
-      //   "M 100 200 C ... Z  m -50 -30 C ... Z"
-      // The second `m` is relative to the PREVIOUS sub-path's end point.
-      // Splitting rawD first and calling .abs() on each piece independently
-      // resolves that `m` against (0,0), placing the hole at the wrong position.
-      // Fix: absolutize the ENTIRE path string in one pass to resolve all
-      // relative commands with the correct accumulated current position,
-      // THEN split. Each piece now starts with an absolute `M`.
+      // Absolutize entire path first so relative `m` hole sub-paths resolve correctly
       const absD = svgpath(rawD).abs().toString();
 
-      // Determine outer vs hole purely by winding area after Y-flip, not by index.
-      // Potrace can emit multiple top-level outer paths (e.g. g, j have a body +
-      // a descender loop — both are outer). Using subIdx===0 as "outer" is wrong;
-      // it forces the 2nd outer path to be treated as a hole → filled solid.
-      //
-      // Potrace winds: outer=CCW, hole=CW in SVG (Y-down).
-      // After scale(1,-1) Y-flip: outer→CW (area<0), hole→CCW (area>0).
-      // Both are already correct for OpenType — just emit as-is, no reversal.
+      // Winding: our OpenCV tracer already enforces the correct winding in image space:
+      //   outer contours = CCW in Y-down image space
+      //   hole  contours = CW  in Y-down image space
+      // After scale(1, -scale) Y-flip:
+      //   outer CCW → CW  (area < 0 in Y-up) = correct OpenType outer
+      //   hole  CW  → CCW (area > 0 in Y-up) = correct OpenType hole
+      // So we just apply the transform and emit — measure pre-flip area to guard
+      // against any edge cases and reverse only if winding came out wrong.
       const path = new opentype.Path();
       splitSubPaths(absD).forEach((subD) => {
+        const preSegs: any[] = [];
+        svgpath(subD)
+          .abs()
+          .translate(-minX, 0)
+          .iterate((seg: any) => preSegs.push([...seg]));
+        if (!preSegs.length) return;
+        const preArea = signedArea(flattenSegments(preSegs));
+        if (preArea === 0) return;
+
         const transformed = svgpath(subD).abs().translate(-minX, 0).scale(scale, -scale).translate(0, 800);
         const segs: any[] = [];
         transformed.iterate((seg: any) => segs.push([...seg]));
         if (!segs.length) return;
-        // After Y-flip: outer contours have negative area, holes have positive area.
-        // Both are already correct for OpenType — no reversal needed.
-        // Only reverse if a contour ended up with the wrong sign (shouldn't happen
-        // with well-formed Potrace output, but guard anyway).
-        const area = signedArea(flattenSegments(segs));
-        // area < 0 → CW → outer (correct for OpenType outer)
-        // area > 0 → CCW → hole (correct for OpenType hole)
-        // area === 0 → degenerate, skip
-        if (area === 0) return;
-        emitToPath(path, segs);
+        const postArea = signedArea(flattenSegments(segs));
+
+        // outer in Y-down: CCW → preArea > 0 → needs CW post-flip → postArea < 0
+        const needsCW = preArea > 0;
+        const isCW = postArea < 0;
+        const final = needsCW !== isCW ? reverseContour(segs) : segs;
+        emitToPath(path, final);
       });
       ogs.push(new opentype.Glyph({ name: g.type, unicode: g.type.charCodeAt(0), advanceWidth: Math.round((maxX - minX) * scale + 60), path }));
     });
@@ -863,11 +1190,11 @@ function App() {
   const isAdjusting = currentStep === "adjusting";
 
   return (
-    <div className="min-h-screen bg-slate-50 font-['Inter'] flex flex-col antialiased text-slate-800">
+    <div className="min-h-screen flex flex-col antialiased text-slate-800" style={{ background: "#f8f9fb", fontFamily: "'Inter', sans-serif" }}>
       {/* ── Topbar ──────────────────────────────────────────────────────── */}
-      <header className="h-14 px-6 bg-white border-b border-slate-100 flex items-center justify-between sticky top-0 z-50">
+      <header className="h-14 px-6 bg-white/95 backdrop-blur border-b border-slate-100 flex items-center justify-between sticky top-0 z-50 shadow-sm shadow-slate-100/80">
         <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg bg-sky-500 flex items-center justify-center shadow-sm shadow-sky-500/40">
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-sky-400 to-indigo-500 flex items-center justify-center shadow-md shadow-sky-500/30">
             <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path
                 strokeLinecap="round"
@@ -877,40 +1204,121 @@ function App() {
               />
             </svg>
           </div>
-          <span className="font-bold text-slate-900 text-[15px] tracking-tight whitespace-nowrap">Hand Writing Font</span>
+          <span className="font-black text-slate-900 text-[15px] tracking-tight whitespace-nowrap">Handwriting Font</span>
+          {isDone && (
+            <span className="hidden sm:inline-flex items-center gap-1 text-[9px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded-full">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+              {glyphs.length} glyphs active
+            </span>
+          )}
         </div>
-        <div className={`flex items-center gap-1.5 text-xs font-medium ${cv ? "text-emerald-600" : "text-amber-500"}`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${cv ? "bg-emerald-500" : "bg-amber-400 animate-pulse"}`}></span>
-          {cv ? "Engine ready" : "Initializing…"}
+
+        {/* Progress steps — visible during processing */}
+        {(isProcessing || isGeneratingFont) && (
+          <div className="hidden md:flex items-center gap-1 text-[9px] font-bold uppercase tracking-widest">
+            {["grayscale", "denoise", "contrast", "threshold", "corners", "warped", "blocks", "extracting"].map((step, idx) => {
+              const steps = ["grayscale", "denoise", "contrast", "threshold", "corners", "warped", "blocks", "extracting"];
+              const currentIdx = steps.indexOf(currentStep);
+              const done = idx < currentIdx;
+              const active = currentStep === step;
+              return (
+                <div key={step} className="flex items-center gap-1">
+                  <span
+                    className={`px-1.5 py-0.5 rounded transition-all duration-300 ${active ? "bg-sky-500 text-white scale-110" : done ? "text-emerald-500" : "text-slate-300"}`}>
+                    {step.slice(0, 3)}
+                  </span>
+                  {idx < 7 && <span className={`w-3 h-px ${done ? "bg-emerald-300" : "bg-slate-200"}`} />}
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="flex items-center gap-3">
+          {isDone && (
+            <button
+              onClick={downloadTTF}
+              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 text-white text-[11px] font-bold rounded-lg hover:bg-sky-600 active:scale-95 transition-all">
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              Export TTF
+            </button>
+          )}
+          <div className={`flex items-center gap-1.5 text-xs font-medium ${cv ? "text-emerald-600" : "text-amber-500"}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${cv ? "bg-emerald-500" : "bg-amber-400 animate-pulse"}`} />
+            <span className="hidden sm:inline">{cv ? "Ready" : "Loading…"}</span>
+          </div>
         </div>
       </header>
 
       <main className="max-w-[1280px] mx-auto w-full px-6 py-12 flex flex-col gap-12">
-        {/* ── Section 1: Hero Section ──────────────────────────────────────────── */}
-        <section className="grid lg:grid-cols-2 gap-16 items-center py-8">
-          {/* Left Side: Hero Content */}
-          <div className="flex flex-col gap-8">
-            <div className="inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full bg-sky-50 border border-sky-100 text-sky-600 text-[11px] font-bold uppercase tracking-wider w-fit">
-              <span className="w-2 h-2 rounded-full bg-sky-500 animate-pulse"></span>
-              Neural Extraction Engine v2.0
-            </div>
+        {/* ── Section 1: Hero ─────────────────────────────────────────────── */}
+        <section className="relative pt-6 pb-4">
+          {/* Ambient background blobs */}
+          <div className="absolute inset-0 -z-10 overflow-hidden pointer-events-none">
+            <div
+              className="absolute -top-32 -left-32 w-[500px] h-[500px] rounded-full opacity-[0.07]"
+              style={{ background: "radial-gradient(circle, #0ea5e9, transparent 70%)" }}
+            />
+            <div
+              className="absolute -bottom-20 -right-20 w-[400px] h-[400px] rounded-full opacity-[0.06]"
+              style={{ background: "radial-gradient(circle, #6366f1, transparent 70%)" }}
+            />
+          </div>
 
-            <div className="flex flex-col gap-4">
-              <h1 className="text-[52px] font-black tracking-tight text-slate-900 leading-[1.05]">
-                Your Handwriting <br />
-                <span className="text-transparent bg-clip-text bg-linear-to-r from-sky-500 to-indigo-600">→ Perfect Typeface</span>
-              </h1>
-              <p className="text-lg text-slate-500 leading-relaxed max-w-lg">
-                Upload a scanned character grid and watch our pipeline vectorize your handwriting into a professional .TTF font in real-time.
-              </p>
+          <div className="grid lg:grid-cols-[1fr_480px] gap-12 xl:gap-20 items-center">
+            {/* ── Left: Copy ────────────────────────────────────────── */}
+            <div className="flex flex-col gap-10">
+              {/* Status pill */}
+              <div className="flex items-center gap-2 w-fit">
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-200 bg-white shadow-sm text-[11px] font-semibold text-slate-500 tracking-wide">
+                  <span className={`w-1.5 h-1.5 rounded-full ${cv ? "bg-emerald-400 shadow-[0_0_6px_#4ade80]" : "bg-amber-400 animate-pulse"}`} />
+                  {cv ? "Engine ready" : "Initializing CV engine…"}
+                </div>
+              </div>
 
-              <div className="flex flex-wrap gap-3 mt-2">
+              {/* Headline */}
+              <div className="flex flex-col gap-5">
+                <h1
+                  style={{ fontFamily: "'Georgia', serif", letterSpacing: "-0.03em" }}
+                  className="text-[56px] xl:text-[68px] font-black text-slate-900 leading-[0.95]">
+                  Turn your
+                  <br />
+                  <span className="relative inline-block">
+                    <span
+                      className="relative z-10"
+                      style={{
+                        backgroundImage: "linear-gradient(135deg, #0ea5e9 0%, #6366f1 50%, #8b5cf6 100%)",
+                        WebkitBackgroundClip: "text",
+                        WebkitTextFillColor: "transparent",
+                        backgroundClip: "text",
+                      }}>
+                      handwriting
+                    </span>
+                    <span
+                      className="absolute -bottom-1 left-0 w-full h-[3px] rounded-full opacity-30"
+                      style={{ background: "linear-gradient(90deg, #0ea5e9, #6366f1)" }}
+                    />
+                  </span>
+                  <br />
+                  into a font.
+                </h1>
+
+                <p className="text-[17px] text-slate-500 leading-relaxed max-w-[420px]" style={{ fontFamily: "'Georgia', serif" }}>
+                  Scan your characters, upload the grid, and get a professional <span className="text-slate-700 font-semibold">.TTF</span> file — powered by
+                  computer vision in your browser.
+                </p>
+              </div>
+
+              {/* CTA buttons */}
+              <div className="flex flex-wrap gap-3">
                 <a
                   href={`${import.meta.env.BASE_URL}FONT-TEMPLATE.pdf`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="px-5 py-2.5 bg-sky-500 text-white text-xs font-bold rounded-xl shadow-lg shadow-sky-500/20 hover:bg-sky-600 transition-all flex items-center gap-2">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  className="group inline-flex items-center gap-2.5 px-5 py-3 rounded-2xl bg-slate-900 text-white text-[13px] font-bold shadow-xl shadow-slate-900/20 hover:bg-slate-800 hover:-translate-y-0.5 active:scale-[0.98] transition-all duration-200">
+                  <svg className="w-4 h-4 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path
                       strokeLinecap="round"
                       strokeLinejoin="round"
@@ -918,172 +1326,179 @@ function App() {
                       d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
                     />
                   </svg>
-                  Get Blank Template
+                  Get Template
                 </a>
                 <a
                   href={`${import.meta.env.BASE_URL}demo-template.jpg`}
                   download
-                  className="px-5 py-2.5 bg-white border border-slate-200 text-slate-600 text-xs font-bold rounded-xl shadow-sm hover:border-sky-200 hover:text-sky-500 transition-all flex items-center gap-2">
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  className="inline-flex items-center gap-2.5 px-5 py-3 rounded-2xl bg-white border border-slate-200 text-slate-600 text-[13px] font-bold shadow-sm hover:border-slate-300 hover:bg-slate-50 hover:-translate-y-0.5 active:scale-[0.98] transition-all duration-200">
+                  <svg className="w-4 h-4 opacity-60" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
-                  Demo Scan
+                  Try Demo Scan
                 </a>
               </div>
-            </div>
 
-            <div className="flex flex-col gap-5">
-              <div className="flex items-center gap-4 text-sm font-medium text-slate-600">
-                <div className="w-10 h-10 rounded-xl bg-white border border-slate-100 shadow-sm flex items-center justify-center text-sky-500">
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="text-slate-900 font-bold">O(1) Processing</p>
-                  <p className="text-slate-400 text-xs text-nowrap">Instant vectorization & manifold correction</p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-4 text-sm font-medium text-slate-600">
-                <div className="w-10 h-10 rounded-xl bg-white border border-slate-100 shadow-sm flex items-center justify-center text-indigo-500">
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="2.5"
-                      d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"
-                    />
-                  </svg>
-                </div>
-                <div>
-                  <p className="text-slate-900 font-bold">Winding Consistency</p>
-                  <p className="text-slate-400 text-xs text-nowrap">Auto-corrects path orientation for TTF compliance</p>
-                </div>
+              {/* Feature grid — 3 compact items */}
+              <div className="grid grid-cols-3 gap-3 pt-2 border-t border-slate-100">
+                {[
+                  { icon: "M13 10V3L4 14h7v7l9-11h-7z", label: "In-browser", sub: "No uploads to server" },
+                  { icon: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z", label: "94 glyphs", sub: "Full ASCII coverage" },
+                  { icon: "M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4", label: "TTF export", sub: "OpenType compliant" },
+                ].map(({ icon, label, sub }) => (
+                  <div key={label} className="flex flex-col gap-1.5 p-3 rounded-xl bg-white border border-slate-100 shadow-sm">
+                    <svg className="w-4 h-4 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d={icon} />
+                    </svg>
+                    <p className="text-[12px] font-black text-slate-800">{label}</p>
+                    <p className="text-[10px] text-slate-400 leading-tight">{sub}</p>
+                  </div>
+                ))}
               </div>
             </div>
-          </div>
 
-          {/* Right Side: Upload Interface */}
-          <div className="w-full relative">
-            <div className="absolute -inset-4 bg-gradient-to-tr from-sky-100/50 to-indigo-100/50 blur-3xl opacity-50 -z-10 rounded-[40px]"></div>
-            <div className="bg-white border border-slate-200 rounded-3xl shadow-xl shadow-slate-200/50 overflow-hidden">
-              {/* Drop-zone */}
-              <div className="relative aspect-[4/3] bg-slate-50 group">
-                {!imageFile ? (
-                  <label className="absolute inset-0 flex flex-col items-center justify-center cursor-pointer hover:bg-sky-50/40 transition-colors duration-300">
-                    <div className="w-16 h-16 rounded-2xl bg-white border border-slate-200 flex items-center justify-center mb-4 shadow-sm group-hover:border-sky-300 group-hover:shadow-sky-100 group-hover:scale-105 transition-all duration-300">
-                      <svg className="w-7 h-7 text-slate-400 group-hover:text-sky-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            {/* ── Right: Upload card ─────────────────────────────────────── */}
+            <div className="relative">
+              {/* Glow halo */}
+              <div
+                className="absolute -inset-6 rounded-[40px] opacity-40 blur-3xl -z-10"
+                style={{ background: "radial-gradient(ellipse at 60% 40%, #bae6fd 0%, #e0e7ff 60%, transparent 100%)" }}
+              />
+
+              <div className="bg-white rounded-3xl border border-slate-200/80 shadow-2xl shadow-slate-200/60 overflow-hidden">
+                {/* Image zone */}
+                <div className="relative bg-slate-50 group" style={{ aspectRatio: "4/3" }}>
+                  {!imageFile ? (
+                    <label
+                      className="absolute inset-0 flex flex-col items-center justify-center cursor-pointer transition-colors duration-300 hover:bg-sky-50/30"
+                      style={{ backgroundImage: "radial-gradient(circle, #e2e8f0 1.5px, transparent 1.5px)", backgroundSize: "24px 24px" }}>
+                      {/* Animated upload icon */}
+                      <div className="relative mb-5">
+                        <div className="w-16 h-16 rounded-2xl bg-white border border-slate-200 shadow-lg flex items-center justify-center group-hover:scale-110 group-hover:border-sky-300 group-hover:shadow-sky-200/60 transition-all duration-300">
+                          <svg
+                            className="w-7 h-7 text-slate-400 group-hover:text-sky-500 transition-colors duration-300"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24">
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth="2"
+                              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+                            />
+                          </svg>
+                        </div>
+                        {/* Orbiting ring */}
+                        <div className="absolute -inset-2 rounded-3xl border-2 border-dashed border-slate-200 group-hover:border-sky-300 group-hover:rotate-6 transition-all duration-500" />
+                      </div>
+                      <p className="text-[15px] font-bold text-slate-700 mb-1">Drop your scan here</p>
+                      <p className="text-[12px] text-slate-400">
+                        or <span className="text-sky-500 font-semibold underline underline-offset-2">browse files</span> · PNG / JPG
+                      </p>
+                      <p className="text-[10px] text-slate-300 mt-3 font-mono tracking-wider">9 × 11 CHARACTER GRID</p>
+                      <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+                    </label>
+                  ) : (
+                    <>
+                      <img src={processedImage!} className="w-full h-full object-contain p-4" alt="scan" />
+
+                      {isProcessing && (
+                        <div className="absolute inset-0 bg-white/70 backdrop-blur-sm flex items-center justify-center">
+                          <div className="absolute top-0 left-0 w-full h-[3px] bg-gradient-to-r from-sky-400 to-indigo-500 shadow-[0_0_12px_rgba(14,165,233,0.8)] animate-scan z-10" />
+                          <div className="bg-white px-5 py-3 rounded-2xl shadow-2xl border border-slate-100 flex items-center gap-3">
+                            <div className="w-4 h-4 border-2 border-sky-500 border-t-transparent rounded-full animate-spin" />
+                            <span className="text-[11px] font-black text-slate-700 uppercase tracking-widest">{currentStep}…</span>
+                          </div>
+                        </div>
+                      )}
+
+                      {!isProcessing && (
+                        <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end justify-center pb-6 gap-2.5">
+                          <label className="px-4 py-2 bg-white/95 backdrop-blur text-slate-800 text-[12px] font-bold rounded-xl cursor-pointer hover:bg-white transition-all shadow-lg">
+                            Change
+                            <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+                          </label>
+                          {isIdle && (
+                            <button
+                              onClick={processImage}
+                              className="px-6 py-2 bg-sky-500 text-white text-[12px] font-bold rounded-xl shadow-xl hover:bg-sky-600 active:scale-95 transition-all">
+                              Run Pipeline
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                {/* Action bar */}
+                <div className="p-4 border-t border-slate-100 flex gap-2.5 bg-slate-50/50">
+                  {!imageFile ? (
+                    <label className="flex-1 py-3.5 rounded-2xl border-2 border-dashed border-slate-200 text-slate-400 text-[13px] font-bold flex items-center justify-center gap-2 cursor-pointer hover:border-sky-300 hover:text-sky-500 hover:bg-white transition-all">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
+                      </svg>
+                      Select Scan
+                      <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
+                    </label>
+                  ) : isIdle ? (
+                    <button
+                      onClick={processImage}
+                      disabled={!cv}
+                      className="flex-1 py-3.5 rounded-2xl text-[13px] font-black flex items-center justify-center gap-2 active:scale-[0.98] disabled:opacity-40 transition-all shadow-lg shadow-sky-500/25 hover:-translate-y-0.5 hover:shadow-xl"
+                      style={{ background: "linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%)", color: "white" }}>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                      </svg>
+                      Start Processing
+                    </button>
+                  ) : isAdjusting || isGeneratingFont ? (
+                    <button
+                      onClick={generateFont}
+                      disabled={isGeneratingFont}
+                      className="flex-1 py-3.5 rounded-2xl bg-slate-900 text-white text-[13px] font-black flex items-center justify-center gap-2 hover:bg-sky-600 active:scale-[0.98] disabled:opacity-40 transition-all shadow-xl">
+                      {isGeneratingFont ? (
+                        <>
+                          <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                          Generating…
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                          </svg>
+                          Generate Font
+                        </>
+                      )}
+                    </button>
+                  ) : isDone ? (
+                    <button
+                      onClick={downloadTTF}
+                      className="flex-1 py-3.5 rounded-2xl bg-slate-900 text-white text-[13px] font-black flex items-center justify-center gap-2 hover:bg-emerald-600 active:scale-[0.98] transition-all shadow-xl">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path
                           strokeLinecap="round"
                           strokeLinejoin="round"
-                          strokeWidth="2"
-                          d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
+                          strokeWidth="2.5"
+                          d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"
                         />
                       </svg>
+                      Export .TTF
+                    </button>
+                  ) : (
+                    <div className="flex-1 py-3.5 rounded-2xl bg-white border border-slate-200 flex items-center justify-center gap-3 text-[13px] text-slate-500 shadow-sm">
+                      <div className="w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin" />
+                      <span className="capitalize font-bold">{currentStep}…</span>
                     </div>
-                    <p className="text-base font-bold text-slate-700">
-                      Drop scan or <span className="text-sky-500 underline decoration-2 underline-offset-4">browse</span>
-                    </p>
-                    <p className="text-xs text-slate-400 mt-2">PNG / JPG · 9×11 character grid</p>
-                    <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
-                  </label>
-                ) : (
-                  <>
-                    <img src={processedImage!} className="w-full h-full object-contain p-4" alt="scan" />
-
-                    {/* Scanning overlay */}
-                    {isProcessing && (
-                      <div className="absolute inset-0 bg-white/60 backdrop-blur-[1px] flex items-center justify-center">
-                        <div className="absolute top-0 left-0 w-full h-[3px] bg-sky-500 shadow-[0_0_20px_rgba(14,165,233,1)] animate-scan z-10"></div>
-                        <div className="bg-white/95 px-6 py-3 rounded-2xl shadow-2xl border border-slate-100 flex items-center gap-3 scale-110">
-                          <div className="w-4 h-4 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
-                          <span className="text-xs font-bold text-slate-800 uppercase tracking-widest">{currentStep}…</span>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Hover overlay when idle or done */}
-                    {!isProcessing && (
-                      <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-end justify-center pb-8 gap-3">
-                        <label className="px-6 py-2.5 bg-white/95 backdrop-blur text-slate-900 text-xs font-bold rounded-xl cursor-pointer hover:bg-white transition active:scale-95 shadow-lg">
-                          Change Image
-                          <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
-                        </label>
-                        {isIdle && (
-                          <button
-                            onClick={processImage}
-                            className="px-8 py-2.5 bg-sky-500 text-white text-xs font-bold rounded-xl shadow-xl hover:bg-sky-600 active:scale-95 transition">
-                            Run Full Pipeline
-                          </button>
-                        )}
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-
-              {/* Bottom action bar */}
-              <div className="px-6 py-5 border-t border-slate-100 flex gap-3 bg-slate-50/40">
-                {!imageFile ? (
-                  <label className="flex-1 py-3.5 rounded-2xl border-2 border-dashed border-slate-200 text-slate-400 text-sm font-bold flex items-center justify-center gap-2.5 cursor-pointer hover:border-sky-300 hover:text-sky-500 hover:bg-white transition-all">
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
-                    </svg>
-                    Select Template Scan
-                    <input type="file" className="hidden" accept="image/*" onChange={handleImageUpload} />
-                  </label>
-                ) : isIdle ? (
-                  <button
-                    onClick={processImage}
-                    disabled={!cv}
-                    className="flex-1 py-3.5 rounded-2xl bg-sky-500 text-white text-sm font-bold flex items-center justify-center gap-2.5 hover:bg-sky-600 active:scale-[0.98] disabled:opacity-40 transition-all shadow-lg shadow-sky-500/25">
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                    </svg>
-                    Initialize Neural Logic
-                  </button>
-                ) : isAdjusting || isGeneratingFont ? (
-                  <button
-                    onClick={generateFont}
-                    disabled={isGeneratingFont}
-                    className="flex-1 py-3.5 rounded-2xl bg-slate-900 text-white text-sm font-bold flex items-center justify-center gap-2.5 hover:bg-sky-600 active:scale-[0.98] disabled:opacity-40 transition-all shadow-xl">
-                    {isGeneratingFont ? (
-                      <>
-                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                        Generating...
-                      </>
-                    ) : (
-                      <>
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M13 10V3L4 14h7v7l9-11h-7z" />
-                        </svg>
-                        Generate Font
-                      </>
-                    )}
-                  </button>
-                ) : isDone ? (
-                  <button
-                    onClick={downloadTTF}
-                    className="flex-1 py-3.5 rounded-2xl bg-slate-900 text-white text-sm font-bold flex items-center justify-center gap-2.5 hover:bg-sky-600 active:scale-[0.98] transition-all shadow-xl">
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                    Export Custom .TTF
-                  </button>
-                ) : (
-                  <div className="flex-1 py-3.5 rounded-2xl bg-white border border-slate-200 flex items-center justify-center gap-3 text-sm text-slate-500 shadow-sm">
-                    <div className="w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin"></div>
-                    <span className="capitalize font-bold tracking-wide">{currentStep}…</span>
-                  </div>
-                )}
-                {imageFile && (
-                  <button
-                    onClick={reset}
-                    className="px-6 py-3.5 rounded-2xl border border-slate-200 text-slate-400 text-sm font-bold hover:border-rose-200 hover:text-rose-500 hover:bg-rose-50 active:scale-[0.98] transition-all">
-                    Reset
-                  </button>
-                )}
+                  )}
+                  {imageFile && (
+                    <button
+                      onClick={reset}
+                      className="px-4 py-3.5 rounded-2xl border border-slate-200 text-slate-400 text-[13px] font-bold hover:border-rose-200 hover:text-rose-400 hover:bg-rose-50 active:scale-[0.98] transition-all">
+                      ✕
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -1191,98 +1606,9 @@ function App() {
               </button>
             </div>
 
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
               {adjustableGlyphs.map((ag, i) => (
-                <div
-                  key={i}
-                  className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm flex flex-col gap-4 hover:border-sky-200 transition-colors group">
-                  <div className="flex items-center justify-between px-1">
-                    <span className="text-lg font-black text-slate-900">{ag.character}</span>
-                    <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">#{i + 1}</span>
-                  </div>
-
-                  <div className="aspect-square bg-slate-50 rounded-xl overflow-hidden flex items-center justify-center border border-slate-100 relative">
-                    <img
-                      src={ag.originalImg}
-                      className="max-w-[70%] max-h-[70%] object-contain grayscale opacity-80 group-hover:opacity-100 transition-opacity"
-                      style={{
-                        transform: `translate(${ag.xOffset}%, ${ag.yOffset}%) scale(${ag.scale}) rotate(${ag.rotation}deg)`,
-                        transition: "transform 0.1s ease-out",
-                      }}
-                    />
-                    <div className="absolute inset-0 border border-slate-200/30 pointer-events-none"></div>
-
-                    {/* 3x3 Grid Guide Lines */}
-                    <div className="absolute top-[25%] left-0 w-full h-[0.5px] bg-sky-500/5 pointer-events-none"></div>
-                    <div className="absolute top-[50%] left-0 w-full h-[0.5px] bg-sky-500/20 pointer-events-none"></div>
-                    <div className="absolute top-[75%] left-0 w-full h-[0.5px] bg-sky-500/5 pointer-events-none"></div>
-
-                    <div className="absolute left-[25%] top-0 w-[0.5px] h-full bg-sky-500/5 pointer-events-none"></div>
-                    <div className="absolute left-[50%] top-0 w-[0.5px] h-full bg-sky-500/20 pointer-events-none"></div>
-                    <div className="absolute left-[75%] top-0 w-[0.5px] h-full bg-sky-500/5 pointer-events-none"></div>
-                  </div>
-
-                  <div className="flex flex-col gap-4 bg-slate-50/50 p-3 rounded-xl">
-                    <div className="flex flex-col gap-1.5">
-                      <div className="flex justify-between items-center">
-                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-wider">Scale</label>
-                        <span className="text-[9px] font-bold text-sky-600">{ag.scale.toFixed(2)}x</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.4"
-                        max="2.5"
-                        step="0.05"
-                        value={ag.scale}
-                        onChange={(e) => updateAdjustableGlyph(i, { scale: parseFloat(e.target.value) })}
-                        className="w-full h-1 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-sky-500"
-                      />
-                    </div>
-
-                    <div className="flex flex-col gap-1.5">
-                      <div className="flex justify-between items-center">
-                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-wider">Rotation</label>
-                        <span className="text-[9px] font-bold text-sky-600">{ag.rotation}°</span>
-                      </div>
-                      <input
-                        type="range"
-                        min="-45"
-                        max="45"
-                        step="1"
-                        value={ag.rotation}
-                        onChange={(e) => updateAdjustableGlyph(i, { rotation: parseFloat(e.target.value) })}
-                        className="w-full h-1 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-sky-500"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="flex flex-col gap-1.5">
-                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-wider">X Offset</label>
-                        <input
-                          type="range"
-                          min="-50"
-                          max="50"
-                          step="1"
-                          value={ag.xOffset}
-                          onChange={(e) => updateAdjustableGlyph(i, { xOffset: parseFloat(e.target.value) })}
-                          className="w-full h-1 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-sky-500"
-                        />
-                      </div>
-                      <div className="flex flex-col gap-1.5">
-                        <label className="text-[9px] font-black text-slate-400 uppercase tracking-wider">Y Offset</label>
-                        <input
-                          type="range"
-                          min="-50"
-                          max="50"
-                          step="1"
-                          value={ag.yOffset}
-                          onChange={(e) => updateAdjustableGlyph(i, { yOffset: parseFloat(e.target.value) })}
-                          className="w-full h-1 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-sky-500"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
+                <GlyphCard key={i} ag={ag} i={i} onUpdate={updateAdjustableGlyph} />
               ))}
             </div>
 
@@ -1346,23 +1672,32 @@ function App() {
 
         {/* ── Section 4: Typography Playground ─────────────────────────── */}
         {isDone && (
-          <section className="bg-white rounded-2xl border border-sky-100 shadow-xl overflow-hidden flex flex-col">
+          <section className="bg-white rounded-2xl border border-slate-100 shadow-xl overflow-hidden flex flex-col">
             {/* Toolbar */}
-            <div className="px-6 py-3.5 border-b border-slate-50 bg-slate-50/50 flex items-center justify-between flex-wrap gap-3">
-              <div className="flex items-center gap-3">
-                <h2 className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">Typography Playground</h2>
-                <span className="inline-flex items-center gap-1 text-[9px] font-semibold text-emerald-600 bg-emerald-50 border border-emerald-100 px-2 py-0.5 rounded-full">
-                  <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
-                  </svg>
-                  Font Active
-                </span>
+            <div className="px-5 py-3 border-b border-slate-100 flex items-center justify-between flex-wrap gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
+                <h2 className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Typography Playground</h2>
               </div>
               <div className="flex items-center gap-2">
+                {/* Font size control */}
+                <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-wider">Size</span>
+                  <input
+                    type="range"
+                    min="24"
+                    max="160"
+                    step="4"
+                    value={previewFontSize}
+                    onChange={(e) => setPreviewFontSize(parseInt(e.target.value))}
+                    className="w-20 h-[3px] rounded-full appearance-none cursor-pointer accent-sky-500 bg-slate-200"
+                  />
+                  <span className="text-[9px] font-bold text-sky-500 w-8 tabular-nums">{previewFontSize}px</span>
+                </div>
                 <button
                   onClick={() => document.getElementById("adjustment-section")?.scrollIntoView({ behavior: "smooth" })}
-                  className="flex items-center gap-1.5 px-4 py-2 bg-white border border-slate-200 text-slate-600 text-xs font-semibold rounded-lg hover:border-sky-300 hover:text-sky-500 transition-all">
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 text-slate-500 text-xs font-semibold rounded-lg hover:border-sky-300 hover:text-sky-500 transition-all">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path
                       strokeLinecap="round"
                       strokeLinejoin="round"
@@ -1370,12 +1705,12 @@ function App() {
                       d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"
                     />
                   </svg>
-                  Tune Alignment
+                  Tune
                 </button>
                 <button
                   onClick={downloadTTF}
-                  className="flex items-center gap-1.5 px-4 py-2 bg-slate-900 text-white text-xs font-semibold rounded-lg hover:bg-sky-600 active:scale-95 transition-all">
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  className="flex items-center gap-1.5 px-4 py-1.5 bg-slate-900 text-white text-xs font-bold rounded-lg hover:bg-sky-600 active:scale-95 transition-all shadow-lg shadow-slate-900/20">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
                   Export .TTF
@@ -1383,29 +1718,33 @@ function App() {
               </div>
             </div>
 
-            {/* Canvas area with dot grid */}
+            {/* Canvas area */}
             <div
-              className="relative flex-1 min-h-[340px] flex items-center justify-center p-10"
-              style={{ backgroundImage: "radial-gradient(circle, #cbd5e1 1px, transparent 1px)", backgroundSize: "22px 22px" }}>
+              className="relative flex-1 min-h-[360px] flex items-center justify-center p-10"
+              style={{ backgroundImage: "radial-gradient(circle, #e2e8f0 1px, transparent 1px)", backgroundSize: "20px 20px" }}>
+              {/* Baseline guide */}
+              <div className="absolute left-10 right-10 border-b border-dashed border-sky-200/60" style={{ top: "55%" }} />
               <textarea
                 id="font-preview"
                 defaultValue="The quick brown fox jumps over the lazy dog."
-                style={{ fontFamily: appliedFontName, fontSize: 100, lineHeight: 1.2 }}
-                className="relative z-10 w-full text-center bg-transparent border-none focus:outline-none resize-none no-scrollbar text-slate-900 placeholder:text-slate-200"
+                style={{ fontFamily: appliedFontName, fontSize: previewFontSize, lineHeight: 1.3 }}
+                className="relative z-10 w-full text-center bg-transparent border-none focus:outline-none resize-none no-scrollbar text-slate-900 placeholder:text-slate-300"
                 spellCheck={false}
                 rows={3}
               />
             </div>
 
             {/* Metadata strip */}
-            <div className="px-6 py-3 border-t border-slate-50 bg-slate-50/40 flex items-center gap-5 flex-wrap">
-              <span className="text-[10px] text-slate-400">
+            <div className="px-5 py-2.5 border-t border-slate-100 bg-slate-50/60 flex items-center gap-4 flex-wrap">
+              <span className="text-[9px] text-slate-400 flex items-center gap-1">
                 <span className="font-semibold text-slate-600">{glyphs.length}</span> glyphs
               </span>
-              <span className="text-[10px] text-slate-400">
+              <span className="text-[9px] text-slate-300">·</span>
+              <span className="text-[9px] text-slate-400 flex items-center gap-1">
                 <span className="font-semibold text-slate-600">1000</span> units/EM
               </span>
-              <span className="text-[10px] font-mono text-sky-500 truncate max-w-[240px]">{appliedFontName}</span>
+              <span className="text-[9px] text-slate-300">·</span>
+              <span className="text-[9px] font-mono text-sky-400 truncate max-w-[200px]">{appliedFontName}</span>
             </div>
           </section>
         )}
