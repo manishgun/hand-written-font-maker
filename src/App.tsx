@@ -6,6 +6,7 @@ import { DOMParser } from "xmldom";
 import svgpath from "svgpath";
 import confetti from "canvas-confetti";
 import { characters } from "./constants";
+import paper from "paper";
 
 const TYPE_SEQUENCE = characters;
 
@@ -308,7 +309,6 @@ function App() {
     cv.adaptiveThreshold(gray, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, Math.max(11, adaptiveBlockSize), 10);
     await snap("threshold", thresh, "Threshold");
 
-
     // ─── Marker Detection 3.0 ──────────────────────────────────────────
     // Add 2px padding to handle markers touching the edge
     const padded = new cv.Mat();
@@ -331,7 +331,6 @@ function App() {
 
       const area = cv.contourArea(cnt);
 
-
       if (r.width < minMSize || r.height < minMSize || r.width > maxMSize || r.height > maxMSize) continue;
 
       const aspectRatio = r.width / r.height;
@@ -339,8 +338,6 @@ function App() {
 
       const extent = area / (r.width * r.height);
       if (extent < 0.3) continue;
-
-
 
       // Level 2 Hierarchy (at least one child) is worth scoring
       const hData = pHier.intPtr(0, i);
@@ -386,10 +383,10 @@ function App() {
           for (let k = j + 1; k < topCandidates.length; k++) {
             for (let l = k + 1; l < topCandidates.length; l++) {
               const rs = [topCandidates[i].r, topCandidates[j].r, topCandidates[k].r, topCandidates[l].r];
-              const minX = Math.min(...rs.map(r => r.x));
-              const maxX = Math.max(...rs.map(r => r.x + r.width));
-              const minY = Math.min(...rs.map(r => r.y));
-              const maxY = Math.max(...rs.map(r => r.y + r.height));
+              const minX = Math.min(...rs.map((r) => r.x));
+              const maxX = Math.max(...rs.map((r) => r.x + r.width));
+              const minY = Math.min(...rs.map((r) => r.y));
+              const maxY = Math.max(...rs.map((r) => r.y + r.height));
               const comboArea = (maxX - minX) * (maxY - minY);
 
               // Also weight by the sum of scores
@@ -407,39 +404,67 @@ function App() {
       rects = bestCombo;
     } else if (candidates.length === 3) {
       // ... (existing 3-marker recovery logic remains)
-      const imgW = src.cols, imgH = src.rows;
+      const imgW = src.cols,
+        imgH = src.rows;
       const idealCorners = [
-        { name: 'tl', x: 0, y: 0 },
-        { name: 'tr', x: imgW, y: 0 },
-        { name: 'br', x: imgW, y: imgH },
-        { name: 'bl', x: 0, y: imgH }
+        { name: "tl", x: 0, y: 0 },
+        { name: "tr", x: imgW, y: 0 },
+        { name: "br", x: imgW, y: imgH },
+        { name: "bl", x: 0, y: imgH },
       ];
       const assigned: Record<string, opencv.Rect | null> = { tl: null, tr: null, br: null, bl: null };
       const usedCandidates = new Set();
-      idealCorners.forEach(corner => {
+      idealCorners.forEach((corner) => {
         let best: any = null;
         let minDist = Infinity;
         candidates.forEach((c, idx) => {
           if (usedCandidates.has(idx)) return;
-          const cx = c.r.x + c.r.width / 2, cy = c.r.y + c.r.height / 2;
+          const cx = c.r.x + c.r.width / 2,
+            cy = c.r.y + c.r.height / 2;
           const d = Math.sqrt((cx - corner.x) ** 2 + (cy - corner.y) ** 2);
-          if (d < minDist) { minDist = d; best = { r: c.r, idx }; }
+          if (d < minDist) {
+            minDist = d;
+            best = { r: c.r, idx };
+          }
         });
-        if (best) { assigned[corner.name] = best.r; usedCandidates.add(best.idx); }
+        if (best) {
+          assigned[corner.name] = best.r;
+          usedCandidates.add(best.idx);
+        }
       });
 
       if (!assigned.tl && assigned.tr && assigned.br && assigned.bl) {
-        assigned.tl = { x: assigned.tr!.x + assigned.bl!.x - assigned.br!.x, y: assigned.tr!.y + assigned.bl!.y - assigned.br!.y, width: assigned.br!.width, height: assigned.br!.height } as any;
+        assigned.tl = {
+          x: assigned.tr!.x + assigned.bl!.x - assigned.br!.x,
+          y: assigned.tr!.y + assigned.bl!.y - assigned.br!.y,
+          width: assigned.br!.width,
+          height: assigned.br!.height,
+        } as any;
       } else if (!assigned.tr && assigned.tl && assigned.br && assigned.bl) {
-        assigned.tr = { x: assigned.tl!.x + assigned.br!.x - assigned.bl!.x, y: assigned.tl!.y + assigned.br!.y - assigned.bl!.y, width: assigned.bl!.width, height: assigned.bl!.height } as any;
+        assigned.tr = {
+          x: assigned.tl!.x + assigned.br!.x - assigned.bl!.x,
+          y: assigned.tl!.y + assigned.br!.y - assigned.bl!.y,
+          width: assigned.bl!.width,
+          height: assigned.bl!.height,
+        } as any;
       } else if (!assigned.br && assigned.tl && assigned.tr && assigned.bl) {
-        assigned.br = { x: assigned.tr!.x + assigned.bl!.x - assigned.tl!.x, y: assigned.tr!.y + assigned.bl!.y - assigned.tl!.y, width: assigned.tl!.width, height: assigned.tl!.height } as any;
+        assigned.br = {
+          x: assigned.tr!.x + assigned.bl!.x - assigned.tl!.x,
+          y: assigned.tr!.y + assigned.bl!.y - assigned.tl!.y,
+          width: assigned.tl!.width,
+          height: assigned.tl!.height,
+        } as any;
       } else if (!assigned.bl && assigned.tl && assigned.tr && assigned.br) {
-        assigned.bl = { x: assigned.tl!.x + assigned.br!.x - assigned.tr!.x, y: assigned.tl!.y + assigned.br!.y - assigned.tr!.y, width: assigned.tr!.width, height: assigned.tr!.height } as any;
+        assigned.bl = {
+          x: assigned.tl!.x + assigned.br!.x - assigned.tr!.x,
+          y: assigned.tl!.y + assigned.br!.y - assigned.tr!.y,
+          width: assigned.tr!.width,
+          height: assigned.tr!.height,
+        } as any;
       }
       rects = Object.values(assigned).filter(Boolean) as opencv.Rect[];
     } else {
-      rects = candidates.map(c => c.r);
+      rects = candidates.map((c) => c.r);
     }
 
     // Visual Stage: Anchor Detection (Drawn on Canvas via decorator to keep 'src' pure)
@@ -479,7 +504,7 @@ function App() {
     // REAL PROCESSING: Create the final clean warped mat
     let warped = src.clone();
 
-    console.log(rects);
+    // console.log(rects);
 
     // if (rects.length !== 4) return;
 
@@ -494,21 +519,22 @@ function App() {
       // Point 2 (BR): Bottom-right of the br-rect -> (br.x + br.width, br.y + br.height)
       // Point 3 (BL): Bottom-left of the bl-rect -> (bl.x, bl.y + bl.height)
       const s = cv.matFromArray(4, 1, cv.CV_32FC2, [
-        tl.x, tl.y + tl.height,
-        tr.x + tr.width, tr.y + tr.height,
-        br.x + br.width, br.y,
-        bl.x, bl.y
+        tl.x,
+        tl.y + tl.height,
+        tr.x + tr.width,
+        tr.y + tr.height,
+        br.x + br.width,
+        br.y,
+        bl.x,
+        bl.y,
 
-
-
-
-        // tl.x, 
+        // tl.x,
         // tl.y,
-        // tr.x + tr.width, 
-        // tr.y, 
-        // br.x + br.width, 
+        // tr.x + tr.width,
+        // tr.y,
+        // br.x + br.width,
         // br.y + br.height,
-        // bl.x, 
+        // bl.x,
         // bl.y + bl.height
       ]);
       const d = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, 2400, 0, 2400, 3000, 0, 3000]);
@@ -543,24 +569,34 @@ function App() {
 
     setCurrentStep("extracting");
     const DIM = { rows: 11, cols: 9, rGap: 0, cGap: 0 };
+
+    console.log("LOG 1");
+
     const w = (warped.cols - (DIM.cols + 1) * DIM.cGap) / DIM.cols;
     const h = (warped.rows - (DIM.rows + 1) * DIM.rGap) / DIM.rows;
     let idx = 0;
+
+    console.log("LOG 2");
+
     const extracted: AdjustableGlyph[] = [];
 
     for (let r = 0; r < DIM.rows; r++) {
       for (let c = 0; c < DIM.cols; c++) {
         const char = TYPE_SEQUENCE[idx++];
+
         if (char) {
           // const x = (c + 1) * DIM.cGap + c * w;
           // const y = (r + 1) * DIM.rGap + r * h;
+
           const x = c * w;
           const y = r * h;
           const cc = document.createElement("canvas");
           cc.width = Math.round(w * 2.5);
           cc.height = Math.round(h * 2.5);
 
-          const roi = warped.roi(new cv.Rect(x + 4, y + 50, w - 4, h - 4));
+          console.log(x, y, w, h, char);
+
+          const roi = warped.roi(new cv.Rect(x > 40 ? x - 40 : x, y + 60, w, h - 60));
           const tmpMat = new cv.Mat();
           cv.resize(roi, tmpMat, new cv.Size(cc.width, cc.height), 0, 0, cv.INTER_LANCZOS4);
           cv.imshow(cc, tmpMat);
@@ -583,6 +619,8 @@ function App() {
       }
     }
 
+    console.log("LOG 3");
+
     setCurrentStep("adjusting");
     setIsProcessing(false);
     gray.delete();
@@ -591,6 +629,8 @@ function App() {
     blurred.delete();
     contrast.delete();
     src.delete();
+    console.log("LOG 4");
+
     setTimeout(() => {
       window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
     }, 400);
@@ -602,6 +642,8 @@ function App() {
     setGlyphs([]);
 
     const extracted: Glyph[] = [];
+
+    paper.setup(new paper.Size(1000, 1000));
 
     for (const ag of adjustableGlyphs) {
       // 1. Create a canvas to apply adjustments correctly
@@ -631,8 +673,26 @@ function App() {
       // 3. Trace SVG from the ADJUSTED image
       const svg = await new Promise<string>((res) => Potrace.trace(adjustedImg, { turdSize: 160 }, (_, r) => res(r || "")));
       if (svg) {
+        const item = paper.project.importSVG(svg);
+
+        const paths: paper.PathItem[] = [];
+
+        item.getItems({ class: paper.PathItem }).forEach((p) => paths.push(p as paper.PathItem));
+
+        let merged: paper.PathItem = paths[0].clone();
+
+        for (let i = 1; i < paths.length; i++) {
+          merged = merged.unite(paths[i]) as paper.PathItem;
+        }
+
+        merged.simplify(0.5);
+
+        const cleanSvg = merged.exportSVG({ asString: true }) as string;
+
+        paper.project.clear();
+
         // Use adjustedImg for the inventory preview so user sees their work
-        const g = { type: ag.character, svg, originalImg: adjustedImg };
+        const g = { type: ag.character, svg: cleanSvg, originalImg: adjustedImg };
         extracted.push(g);
         setGlyphs((p) => [...p, g]);
       }
@@ -729,7 +789,7 @@ function App() {
 
     // Start audio early to compensate for latency
     const audio = new Audio(`${import.meta.env.BASE_URL}confetti-gun.mp3`);
-    audio.play().catch(() => { });
+    audio.play().catch(() => {});
 
     const name = `UF_${Math.random().toString(36).substr(2, 8)}`;
     try {
