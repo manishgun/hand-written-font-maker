@@ -32,6 +32,7 @@ export default function A4Template() {
           {Array.from({ length: rows * cols }).map((_, i) => (
             <div key={i} className="border border-black/10">
               <div className="w-full h-[4mm] border-b border-black/10 text-[10px] text-black/70 pl-1">{characters[i] ?? ""}</div>
+              <div className="flex justify-center items-center h-[calc(100%-4mm)] text-3xl opacity-10">{characters[i]}</div>
             </div>
           ))}
         </div>

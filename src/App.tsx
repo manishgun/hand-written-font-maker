@@ -464,7 +464,6 @@ function GlyphCard({ ag, i, onUpdate }: GlyphCardProps) {
         className="aspect-square bg-gradient-to-br from-slate-50 to-slate-100/50 rounded-xl overflow-hidden flex items-center justify-center relative cursor-grab active:cursor-grabbing select-none border border-slate-100 group-hover:border-sky-200 transition-colors"
         onMouseDown={onMouseDown}
         onTouchStart={onTouchStart}>
-
         {/* Image — React-controlled transform, no direct DOM mutation */}
         <img
           src={ag.originalImg}
@@ -1391,7 +1390,7 @@ function App() {
               {/* CTA buttons */}
               <div className="flex flex-wrap gap-3">
                 <a
-                  href={`${import.meta.env.BASE_URL}FONT-TEMPLATE.pdf`}
+                  href={`${import.meta.env.BASE_URL}FONT-TEMPLATE-NEW.pdf`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="group inline-flex items-center gap-2.5 px-5 py-3 rounded-2xl bg-slate-900 text-white text-[13px] font-bold shadow-xl shadow-slate-900/20 hover:bg-slate-800 hover:-translate-y-0.5 active:scale-[0.98] transition-all duration-200">
@@ -1699,7 +1698,6 @@ function App() {
           </section>
         )}
 
-
         {/* ── Section 5: Global Refinement ────────────────────────────── */}
         {isDone && (
           <section className="relative bg-white rounded-3xl border-2 border-slate-900 shadow-2xl shadow-slate-200/50 overflow-hidden animate-fade-in-up">
@@ -1898,7 +1896,7 @@ function App() {
                       <span className="text-sky-500 tabular-nums">{generationProgress}%</span>
                     </div>
                     <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden border border-slate-50">
-                      <div 
+                      <div
                         className="h-full bg-gradient-to-r from-sky-400 to-indigo-500 transition-all duration-300 ease-out"
                         style={{ width: `${generationProgress}%` }}
                       />
@@ -2044,49 +2042,57 @@ function App() {
                     <div className="flex items-start gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-sky-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Global Size:</strong> Recalibrates glyph height. Use this so your font matches the size of standard system fonts when typed.
+                        <strong className="text-slate-200 uppercase tracking-tighter">Global Size:</strong> Recalibrates glyph height. Use this so your font
+                        matches the size of standard system fonts when typed.
                       </p>
                     </div>
                     <div className="flex items-start gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Vertical Shift:</strong> Fixes "floating" text. Adjust the baseline offset to ensure letters sit perfectly on the line.
+                        <strong className="text-slate-200 uppercase tracking-tighter">Vertical Shift:</strong> Fixes "floating" text. Adjust the baseline offset
+                        to ensure letters sit perfectly on the line.
                       </p>
                     </div>
                     <div className="flex items-start gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-sky-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Kerning:</strong> Adjust if letters feel too far apart. Natural handwriting usually looks better with a high kerning (+25 to +40).
+                        <strong className="text-slate-200 uppercase tracking-tighter">Kerning:</strong> Adjust if letters feel too far apart. Natural
+                        handwriting usually looks better with a high kerning (+25 to +40).
                       </p>
                     </div>
                     <div className="flex items-start gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-sky-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Space Width:</strong> Controls word distance. 300–400 is standard; decrease for rapid, compact handwriting.
+                        <strong className="text-slate-200 uppercase tracking-tighter">Space Width:</strong> Controls word distance. 300–400 is standard;
+                        decrease for rapid, compact handwriting.
                       </p>
                     </div>
                     <div className="flex items-start gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-amber-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Slant:</strong> Natural handwriting slants slightly to the right (+5° to +12°). Programmatic italics.
+                        <strong className="text-slate-200 uppercase tracking-tighter">Slant:</strong> Natural handwriting slants slightly to the right (+5° to
+                        +12°). Programmatic italics.
                       </p>
                     </div>
                     <div className="flex items-start gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-rose-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Ink Weight:</strong> Simulates different pens. Positive values mimic a felt-tip marker; negative values mimic a fine-line pen.
+                        <strong className="text-slate-200 uppercase tracking-tighter">Ink Weight:</strong> Simulates different pens. Positive values mimic a
+                        felt-tip marker; negative values mimic a fine-line pen.
                       </p>
                     </div>
                     <div className="flex items-start gap-3">
                       <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Fidelity:</strong> Lower values (0.1) capture every bump in the ink; higher values (2.0+) create ultra-smooth, cleaned-up curves.
+                        <strong className="text-slate-200 uppercase tracking-tighter">Fidelity:</strong> Lower values (0.1) capture every bump in the ink;
+                        higher values (2.0+) create ultra-smooth, cleaned-up curves.
                       </p>
                     </div>
                     <div className="flex items-start gap-3 border-t border-white/5 pt-4">
                       <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 mt-1.5 shrink-0" />
                       <p className="text-[11px] leading-relaxed text-slate-400">
-                        <strong className="text-slate-200 uppercase tracking-tighter">Metadata Branding:</strong> The Name, Designer, and Version are embedded in the font. This is what you'll see in font menus like Microsoft Word or Apple Font Book.
+                        <strong className="text-slate-200 uppercase tracking-tighter">Metadata Branding:</strong> The Name, Designer, and Version are embedded
+                        in the font. This is what you'll see in font menus like Microsoft Word or Apple Font Book.
                       </p>
                     </div>
                   </div>
