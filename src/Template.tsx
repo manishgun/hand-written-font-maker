@@ -19,7 +19,7 @@ export default function A4Template() {
           height: "297mm",
           padding: "20mm 6mm",
         }}>
-        <div className="text-2xl font-semibold top-20 absolute left-1/2 -translate-x-1/2 text-black/70">HAND-WRITTEN FONT MAKER</div>
+        <div className="text-2xl font-semibold top-8 absolute left-1/2 -translate-x-1/2 text-black/70">HAND-WRITTEN FONT MAKER</div>
         <div className="text-xl font-semibold bottom-6 absolute left-1/2 -translate-x-1/2 text-black/20">Made By Manish Gun</div>
         {/* Corner Markers */}
         <Marker position="top-left" />
